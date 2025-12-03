@@ -16,6 +16,7 @@ DEBUG_PNG = OUTPUT_DIR / "debug_toutiao.png"
 RAW_HTML = OUTPUT_DIR / "raw_goto_response.html"
 
 
+# JS：统计当前页面上“识别为作品”的链接个数
 ARTICLE_COUNT_JS = r"""
 () => {
   const anchors = Array.from(document.querySelectorAll("a[href]"));
@@ -32,13 +33,12 @@ ARTICLE_COUNT_JS = r"""
 
       const path = url.pathname || "/";
 
-      // 排除一些明显不是作品的路径
+      // 排除明显不是作品的路径
       if (path.startsWith("/c/user/")) return false;
       if (path.startsWith("/license")) return false;
       if (path.startsWith("/business_license")) return false;
-      if (path.startsWith("/a3642705768")) return false; // 跟帖评论自律管理承诺书等
+      if (path.startsWith("/a3642705768")) return false; // 跟帖评论自律管理承诺书
 
-      // 最后一个非空片段
       const segments = path.split("/").filter(Boolean);
       if (segments.length === 0) return false;
       const last = segments[segments.length - 1];
@@ -69,6 +69,7 @@ ARTICLE_COUNT_JS = r"""
 """
 
 
+# JS：真正提取作品链接 + 文本
 EXTRACT_ARTICLES_JS = r"""
 () => {
   const anchors = Array.from(document.querySelectorAll("a[href]"));
@@ -211,6 +212,7 @@ async def main():
         )
         page = await context.new_page()
 
+        # 打印浏览器控制台日志，方便调试
         page.on(
             "console",
             lambda msg: print(f"[BROWSER_CONSOLE] {msg.type}: {msg.text}")
@@ -233,11 +235,17 @@ async def main():
             timeout=60000,
         )
 
+        page_ok = False
         if resp is None:
             print("[WARN] goto 返回的 Response 是 None，可能是通过 JS 重定向。")
-        else,:
+        else:
             status = resp.status
             print(f"[INFO] 主页首包状态码: {status}")
+            if 200 <= status < 400:
+                page_ok = True
+            else:
+                print("[WARN] 主页 HTTP 状态码异常，将视为打开失败。")
+
             try:
                 text = await resp.text()
                 RAW_HTML.write_text(text, encoding="utf-8")
@@ -247,6 +255,7 @@ async def main():
             except Exception as e:
                 print("[WARN] 无法读取首包 HTML:", e)
 
+        # 首屏加载后多等一会，给 JS / 首次接口时间
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(10000)
 
@@ -255,15 +264,24 @@ async def main():
         print(f"[INFO] 页面标题: {repr(title)}")
         print(f"[INFO] 当前 URL: {current_url}")
 
+        # 慢慢下滑，尽量把所有作品加载出来
         await slow_scroll_load(page)
 
         print("[INFO] 开始从页面所有链接中识别作品链接...")
-
         links = await page.evaluate(EXTRACT_ARTICLES_JS)
 
-        print(f"[INFO] 共提取到链接 {len(links)} 条。")
+        print(f"[INFO] 共识别到作品链接 {len(links)} 条。")
         for i, item in enumerate(links[:20], start=1):
             print(f"[DEBUG] #{i} {item['href']}  标题: {item['text'][:50]}")
+
+        # ===== 决定是否更新数据文件 =====
+        should_update = False
+        if not page_ok:
+            print("[WARN] 主页打开失败（HTTP 状态码异常），不更新 toutiao_links.json，保留历史数据。")
+        elif len(links) == 0:
+            print("[WARN] 没有识别到任何作品链接，不更新 toutiao_links.json，保留历史数据。")
+        else:
+            should_update = True
 
         timestamp = datetime.utcnow().isoformat() + "Z"
         result = {
@@ -273,12 +291,16 @@ async def main():
             "links": links,
         }
 
-        LINKS_FILE.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"[INFO] 已写入文件: {LINKS_FILE}")
+        if should_update:
+            LINKS_FILE.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[INFO] 已更新文件: {LINKS_FILE}")
+        else:
+            print("[INFO] 本次运行不更新 toutiao_links.json（避免用空数据覆盖历史有效数据）。")
 
+        # 无论是否更新数据文件，都保存最终 DOM 和截图，方便调试
         html_content = await page.content()
         DEBUG_HTML.write_text(html_content, encoding="utf-8")
         await page.screenshot(path=str(DEBUG_PNG), full_page=True)
