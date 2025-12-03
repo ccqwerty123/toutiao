@@ -1,6 +1,3 @@
-# 改成你的主页地址
-TOUTIAO_URL = "https://www.toutiao.com/c/user/token/CiyRLPHkUyTCD9FmHodOGQVcmZh5-NRKyfiTSF0XMms-tSja0FdhrUWRp-T-DBpJCjwAAAAAAAAAAAAAT8lExjCbDHcWTgszQQjqU0Ohh9qtuXbuEOe6CQdqJEZ7yIpoM-NJ93_Sty1iMpOe_FUQ9ZmDDhjDxYPqBCIBA9GPpzc="
-
 import asyncio
 import json
 from datetime import datetime
@@ -9,7 +6,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 # 改成你的主页地址
-# TOUTIAO_URL = "https://www.toutiao.com/c/user/token/你的token"
+TOUTIAO_URL = "https://www.toutiao.com/c/user/token/你的token"
 
 OUTPUT_DIR = Path("data")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -19,56 +16,179 @@ DEBUG_PNG = OUTPUT_DIR / "debug_toutiao.png"
 RAW_HTML = OUTPUT_DIR / "raw_goto_response.html"
 
 
+ARTICLE_COUNT_JS = r"""
+() => {
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const origin = window.location.origin;
+
+  const isArticleLike = (href) => {
+    if (!href) return false;
+    if (href === "/" || href === "#" || href.trim() === "") return false;
+    if (href.startsWith("sslocal://")) return false; // APP 内链
+
+    try {
+      const url = new URL(href, origin);
+      if (url.origin !== origin) return false;
+
+      const path = url.pathname || "/";
+
+      // 排除一些明显不是作品的路径
+      if (path.startsWith("/c/user/")) return false;
+      if (path.startsWith("/license")) return false;
+      if (path.startsWith("/business_license")) return false;
+      if (path.startsWith("/a3642705768")) return false; // 跟帖评论自律管理承诺书等
+
+      // 最后一个非空片段
+      const segments = path.split("/").filter(Boolean);
+      if (segments.length === 0) return false;
+      const last = segments[segments.length - 1];
+
+      const pure = last.split("#")[0].split("?")[0];
+      if (!pure) return false;
+
+      const digits = pure.replace(/\D/g, "").length;
+      if (digits < 6) return false;                 // 至少一定长度的数字
+      if (digits / pure.length < 0.6) return false; // 大部分字符是数字
+
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const set = new Set();
+  for (const a of anchors) {
+    const rawHref = a.getAttribute("href") || "";
+    if (!isArticleLike(rawHref)) continue;
+    const url = new URL(rawHref, origin);
+    const canonical = origin + url.pathname; // 去掉 query/hash
+    set.add(canonical);
+  }
+  return set.size;
+}
+"""
+
+
+EXTRACT_ARTICLES_JS = r"""
+() => {
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const origin = window.location.origin;
+
+  const isArticleLike = (href) => {
+    if (!href) return false;
+    if (href === "/" || href === "#" || href.trim() === "") return false;
+    if (href.startsWith("sslocal://")) return false;
+
+    try {
+      const url = new URL(href, origin);
+      if (url.origin !== origin) return false;
+
+      const path = url.pathname || "/";
+
+      if (path.startsWith("/c/user/")) return false;
+      if (path.startsWith("/license")) return false;
+      if (path.startsWith("/business_license")) return false;
+      if (path.startsWith("/a3642705768")) return false;
+
+      const segments = path.split("/").filter(Boolean);
+      if (segments.length === 0) return false;
+      const last = segments[segments.length - 1];
+
+      const pure = last.split("#")[0].split("?")[0];
+      if (!pure) return false;
+
+      const digits = pure.replace(/\D/g, "").length;
+      if (digits < 6) return false;
+      if (digits / pure.length < 0.6) return false;
+
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  // 文本中包含这些词的，多半是底部版权/举报等非作品链接
+  const badTextPattern = /侵权举报|举报受理公示|京ICP|ICP备|营业执照|公司名称|跟帖评论自律管理承诺书/;
+
+  const map = new Map();
+
+  for (const a of anchors) {
+    const rawHref = a.getAttribute("href") || "";
+    if (!isArticleLike(rawHref)) continue;
+
+    const url = new URL(rawHref, origin);
+    const canonical = origin + url.pathname;
+
+    let text = (a.textContent || "").trim();
+    if (!text) {
+      const p = a.closest("p");
+      if (p) text = (p.textContent || "").trim();
+    }
+    if (!text) text = canonical;
+
+    if (badTextPattern.test(text)) continue;
+
+    let entry = map.get(canonical);
+    if (!entry) {
+      entry = { href: canonical, texts: [] };
+      map.set(canonical, entry);
+    }
+    entry.texts.push(text);
+  }
+
+  const results = [];
+  for (const { href, texts } of map.values()) {
+    let title = href;
+    if (texts && texts.length > 0) {
+      title = texts.reduce(
+        (best, cur) => (cur.length > best.length ? cur : best),
+        texts[0]
+      );
+    }
+    results.push({ href, text: title });
+  }
+
+  return results;
+}
+"""
+
+
 async def slow_scroll_load(page):
     """
     慢慢下滑加载更多内容：
     - 每次滑到底部后等几秒
-    - 统计 p.content > a 的数量，如果连续几轮没有增长，就停止
+    - 统计“识别到的作品链接数量”，如果连续几轮没有增长，就停止
     """
-    max_scrolls = 20          # 最多下滑 20 次，根据需要可以再调大
-    wait_after_scroll = 4000  # 每次滑动后等待 4 秒（毫秒）
-    no_growth_limit = 3       # 连续 3 次没有新文章就停止
+    max_scrolls = 40          # 最多下滑 40 次
+    wait_after_scroll = 5000  # 每次滑动后等待 5 秒（毫秒）
+    no_growth_limit = 4       # 连续 4 次没有新作品就停止
 
     last_count = 0
     same_count_times = 0
 
     for i in range(max_scrolls):
-        # 统计当前已经出现的文章数量
-        count = await page.eval_on_selector_all(
-            "p.content > a[href^='/']",
-            "elements => elements.length"
-        )
-        print(f"[SCROLL] 第 {i + 1} 轮前，已检测到文章数：{count}")
+        count_before = await page.evaluate(ARTICLE_COUNT_JS)
+        print(f"[SCROLL] 第 {i + 1} 轮前，识别到作品数：{count_before}")
 
-        if count == last_count:
-            same_count_times += 1
-        else:
-            same_count_times = 0
-        last_count = count
-
-        # 滑到底部
         print("[SCROLL] 滑动到页面底部...")
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(wait_after_scroll)
 
-        # 再检测一次，看是否有新增
-        new_count = await page.eval_on_selector_all(
-            "p.content > a[href^='/']",
-            "elements => elements.length"
-        )
-        print(f"[SCROLL] 第 {i + 1} 轮后，文章数：{new_count}")
+        count_after = await page.evaluate(ARTICLE_COUNT_JS)
+        print(f"[SCROLL] 第 {i + 1} 轮后，作品数：{count_after}")
 
-        if new_count == count:
+        if count_after <= last_count:
             same_count_times += 1
         else:
             same_count_times = 0
-        last_count = new_count
+
+        last_count = count_after
 
         if same_count_times >= no_growth_limit:
-            print("[SCROLL] 连续多次没有新文章出现，认为已经到底，停止下滑。")
+            print("[SCROLL] 连续多次没有新增作品，认为已经到底，停止下滑。")
             break
 
-    print(f"[SCROLL] 下滑结束，最终检测到文章数：{last_count}")
+    print(f"[SCROLL] 下滑结束，最终识别到作品数：{last_count}")
 
 
 async def main():
@@ -91,7 +211,6 @@ async def main():
         )
         page = await context.new_page()
 
-        # 打印浏览器控制台日志，方便调试 JS 报错
         page.on(
             "console",
             lambda msg: print(f"[BROWSER_CONSOLE] {msg.type}: {msg.text}")
@@ -116,7 +235,7 @@ async def main():
 
         if resp is None:
             print("[WARN] goto 返回的 Response 是 None，可能是通过 JS 重定向。")
-        else:
+        else,:
             status = resp.status
             print(f"[INFO] 主页首包状态码: {status}")
             try:
@@ -128,59 +247,22 @@ async def main():
             except Exception as e:
                 print("[WARN] 无法读取首包 HTML:", e)
 
-        # 第一次加载后多等一会，给 JS 时间
         await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(10000)
 
         title = await page.title()
         current_url = page.url
         print(f"[INFO] 页面标题: {repr(title)}")
         print(f"[INFO] 当前 URL: {current_url}")
 
-        # 使用“慢下滑”逻辑加载尽可能多的文章
         await slow_scroll_load(page)
 
-        print("[INFO] 开始从 DOM 中提取文章链接（p.content > a）...")
+        print("[INFO] 开始从页面所有链接中识别作品链接...")
 
-        # 只抓 <p class="content"><a href="/..."> 这种结构
-        links = await page.evaluate(
-            """
-() => {
-  const anchors = Array.from(
-    document.querySelectorAll("p.content > a[href^='/']")
-  );
-
-  // 路径形如 /某字母/若干数字[/]，例如 /w/1849150482805763/ 或 /z/123456/
-  const pathPattern = /^\\/[a-zA-Z]\\/\\d+\\/?$/;
-
-  const results = [];
-  const seen = new Set();
-
-  for (const a of anchors) {
-    let href = a.getAttribute("href") || "";
-    let text = a.textContent || "";
-    text = text.trim();
-    if (!href || !text) continue;
-
-    const url = new URL(href, window.location.origin);
-    const pathname = url.pathname;
-
-    if (!pathPattern.test(pathname)) continue;
-
-    const finalHref = url.href;
-    if (seen.has(finalHref)) continue;
-    seen.add(finalHref);
-
-    results.push({ href: finalHref, text });
-  }
-
-  return results;
-}
-            """
-        )
+        links = await page.evaluate(EXTRACT_ARTICLES_JS)
 
         print(f"[INFO] 共提取到链接 {len(links)} 条。")
-        for i, item in enumerate(links[:10], start=1):
+        for i, item in enumerate(links[:20], start=1):
             print(f"[DEBUG] #{i} {item['href']}  标题: {item['text'][:50]}")
 
         timestamp = datetime.utcnow().isoformat() + "Z"
@@ -197,7 +279,6 @@ async def main():
         )
         print(f"[INFO] 已写入文件: {LINKS_FILE}")
 
-        # 保存最终 DOM 和截图，方便以后再排查结构变化
         html_content = await page.content()
         DEBUG_HTML.write_text(html_content, encoding="utf-8")
         await page.screenshot(path=str(DEBUG_PNG), full_page=True)
