@@ -1,17 +1,13 @@
 name: Scrape Toutiao
 
 on:
-  # 1. 手动触发（调试用，必定执行，不走随机跳过逻辑）
   workflow_dispatch:
 
-  # 2. 定时触发
-  # 北京时间 (UTC+8) 08:00 ~ 23:00，每 2 小时执行一次
-  # UTC 时间对应：00:00 ~ 15:00
   schedule:
     - cron: '0 0-15/2 * * *'
 
 permissions:
-  contents: write   # 允许工作流程向仓库推送变更
+  contents: write
 
 jobs:
   scrape:
@@ -21,22 +17,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ==========================================
-      # 随机执行判断逻辑
-      # ==========================================
       - name: Check Execution Condition (Random Skip)
         id: check_run
         shell: bash
         run: |
-          # 默认设置为执行
           should_run="true"
-          
-          # 只有在【定时触发】的情况下，才进行 50% 的概率判定
           if [ "${{ github.event_name }}" == "schedule" ]; then
-            # 生成随机数 0 或 1
             ROLL=$((RANDOM % 2))
             echo "Dice rolled (0=Skip, 1=Run): $ROLL"
-            
             if [ "$ROLL" -eq "0" ]; then
               echo "Decision: 随机结果为跳过 (SKIP)."
               should_run="false"
@@ -47,13 +35,8 @@ jobs:
           else
             echo "Trigger event is '${{ github.event_name }}'. Skipping random check. FORCE RUN."
           fi
-
-          # 将结果输出到 GitHub Actions 变量中，供后续步骤读取
           echo "should_run=$should_run" >> $GITHUB_OUTPUT
 
-      # ==========================================
-      # 环境配置 (仅当 should_run 为 true 时执行)
-      # ==========================================
       - name: Setup Python
         if: steps.check_run.outputs.should_run == 'true'
         uses: actions/setup-python@v5
@@ -63,12 +46,12 @@ jobs:
       - name: Install dependencies
         if: steps.check_run.outputs.should_run == 'true'
         run: |
-          # 关键：统一用当前 python 对应的 pip
+          # 用当前 python 对应的 pip 安装
           python -m pip install --upgrade pip
-          python -m pip install playwright real-useragent
+          python -m pip install playwright real-useragent requests
           python -m playwright install --with-deps chromium
 
-      # （可选）验证 real-useragent 是否真能被当前 Python 导入
+      # 可选：验证 real-useragent 是否正常工作
       - name: Verify real-useragent
         if: steps.check_run.outputs.should_run == 'true'
         run: |
@@ -85,13 +68,8 @@ jobs:
             print("Sample UA:", ua.desktop_useragent()[:120])
           except Exception as e:
             print("real_useragent test FAILED:", repr(e))
-            # 如不想因 UA 库失败而整个流程失败，可去掉下面这行
-            # raise
           PY
 
-      # ==========================================
-      # 核心运行 (仅当 should_run 为 true 时执行)
-      # ==========================================
       - name: Run Toutiao scraper
         if: steps.check_run.outputs.should_run == 'true'
         run: |
@@ -99,9 +77,6 @@ jobs:
           python scrape_toutiao.py
           echo "===== 抓取脚本结束 ====="
 
-      # ==========================================
-      # 调试信息 (仅当 should_run 为 true 时执行)
-      # ==========================================
       - name: Show output files (for debug)
         if: steps.check_run.outputs.should_run == 'true'
         run: |
@@ -124,24 +99,17 @@ jobs:
             data/debug/
           if-no-files-found: warn
 
-      # ==========================================
-      # 代码提交 (仅当 should_run 为 true 时执行)
-      # ==========================================
       - name: Commit and push changes
         if: steps.check_run.outputs.should_run == 'true' && success()
         run: |
           echo "===== 检查是否有文件变更需要提交 ====="
           git status --porcelain
-
-          # 如果仓库是干净的，直接退出
           if [ -z "$(git status --porcelain)" ]; then
             echo "没有文件变更，跳过提交。"
             exit 0
           fi
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add data || true
           git commit -m "Update Toutiao data [skip ci]" || echo "没有可提交的变更"
           git push
