@@ -1,3 +1,6 @@
+# 改成你的主页地址
+TOUTIAO_URL = "https://www.toutiao.com/c/user/token/CiyRLPHkUyTCD9FmHodOGQVcmZh5-NRKyfiTSF0XMms-tSja0FdhrUWRp-T-DBpJCjwAAAAAAAAAAAAAT8lExjCbDHcWTgszQQjqU0Ohh9qtuXbuEOe6CQdqJEZ7yIpoM-NJ93_Sty1iMpOe_FUQ9ZmDDhjDxYPqBCIBA9GPpzc="
+
 import asyncio
 import json
 from datetime import datetime
@@ -6,7 +9,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 # 改成你的主页地址
-TOUTIAO_URL = "https://www.toutiao.com/c/user/token/CiyRLPHkUyTCD9FmHodOGQVcmZh5-NRKyfiTSF0XMms-tSja0FdhrUWRp-T-DBpJCjwAAAAAAAAAAAAAT8lExjCbDHcWTgszQQjqU0Ohh9qtuXbuEOe6CQdqJEZ7yIpoM-NJ93_Sty1iMpOe_FUQ9ZmDDhjDxYPqBCIBA9GPpzc="
+# TOUTIAO_URL = "https://www.toutiao.com/c/user/token/你的token"
 
 OUTPUT_DIR = Path("data")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -14,6 +17,58 @@ LINKS_FILE = OUTPUT_DIR / "toutiao_links.json"
 DEBUG_HTML = OUTPUT_DIR / "debug_toutiao.html"
 DEBUG_PNG = OUTPUT_DIR / "debug_toutiao.png"
 RAW_HTML = OUTPUT_DIR / "raw_goto_response.html"
+
+
+async def slow_scroll_load(page):
+    """
+    慢慢下滑加载更多内容：
+    - 每次滑到底部后等几秒
+    - 统计 p.content > a 的数量，如果连续几轮没有增长，就停止
+    """
+    max_scrolls = 20          # 最多下滑 20 次，根据需要可以再调大
+    wait_after_scroll = 4000  # 每次滑动后等待 4 秒（毫秒）
+    no_growth_limit = 3       # 连续 3 次没有新文章就停止
+
+    last_count = 0
+    same_count_times = 0
+
+    for i in range(max_scrolls):
+        # 统计当前已经出现的文章数量
+        count = await page.eval_on_selector_all(
+            "p.content > a[href^='/']",
+            "elements => elements.length"
+        )
+        print(f"[SCROLL] 第 {i + 1} 轮前，已检测到文章数：{count}")
+
+        if count == last_count:
+            same_count_times += 1
+        else:
+            same_count_times = 0
+        last_count = count
+
+        # 滑到底部
+        print("[SCROLL] 滑动到页面底部...")
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(wait_after_scroll)
+
+        # 再检测一次，看是否有新增
+        new_count = await page.eval_on_selector_all(
+            "p.content > a[href^='/']",
+            "elements => elements.length"
+        )
+        print(f"[SCROLL] 第 {i + 1} 轮后，文章数：{new_count}")
+
+        if new_count == count:
+            same_count_times += 1
+        else:
+            same_count_times = 0
+        last_count = new_count
+
+        if same_count_times >= no_growth_limit:
+            print("[SCROLL] 连续多次没有新文章出现，认为已经到底，停止下滑。")
+            break
+
+    print(f"[SCROLL] 下滑结束，最终检测到文章数：{last_count}")
 
 
 async def main():
@@ -73,26 +128,21 @@ async def main():
             except Exception as e:
                 print("[WARN] 无法读取首包 HTML:", e)
 
-        # 等待网络基本空闲，再多等几秒给 JS 时间
+        # 第一次加载后多等一会，给 JS 时间
         await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(8000)
 
         title = await page.title()
         current_url = page.url
         print(f"[INFO] 页面标题: {repr(title)}")
         print(f"[INFO] 当前 URL: {current_url}")
 
-        # 向下滚动几次，触发更多内容加载
-        for i in range(3):
-            print(f"[INFO] 向下滚动第 {i + 1} 次...")
-            await page.evaluate(
-                "window.scrollBy(0, document.body.scrollHeight / 2)"
-            )
-            await page.wait_for_timeout(3000)
+        # 使用“慢下滑”逻辑加载尽可能多的文章
+        await slow_scroll_load(page)
 
         print("[INFO] 开始从 DOM 中提取文章链接（p.content > a）...")
 
-        # ★ 核心：只抓 <p class="content"><a href="/..."> 这种结构
+        # 只抓 <p class="content"><a href="/..."> 这种结构
         links = await page.evaluate(
             """
 () => {
@@ -115,7 +165,6 @@ async def main():
     const url = new URL(href, window.location.origin);
     const pathname = url.pathname;
 
-    // 必须符合 /字母/数字 的形式
     if (!pathPattern.test(pathname)) continue;
 
     const finalHref = url.href;
