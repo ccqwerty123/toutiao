@@ -1,8 +1,14 @@
 name: Scrape Toutiao
 
 on:
-  # 手动触发，调试方便
+  # 1. 手动触发 (调试用，必定执行，不走随机跳过逻辑)
   workflow_dispatch:
+  
+  # 2. 定时触发
+  # 北京时间 (UTC+8) 08:00 ~ 23:00，每2小时执行一次
+  # UTC 时间对应：00:00 ~ 15:00
+  schedule:
+    - cron: '0 0-15/2 * * *'
 
 permissions:
   contents: write   # 允许工作流程向仓库推送变更
@@ -15,46 +21,94 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ==========================================
+      # 新增：随机执行判断逻辑
+      # ==========================================
+      - name: Check Execution Condition (Random Skip)
+        id: check_run
+        shell: bash
+        run: |
+          # 默认设置为执行
+          should_run="true"
+          
+          # 只有在【定时触发】的情况下，才进行 50% 的概率判定
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            # 生成随机数 0 或 1
+            ROLL=$((RANDOM % 2))
+            echo "Dice rolled (0=Skip, 1=Run): $ROLL"
+            
+            if [ "$ROLL" -eq "0" ]; then
+              echo "Decision: 随机结果为跳过 (SKIP)."
+              should_run="false"
+            else
+              echo "Decision: 随机结果为执行 (RUN)."
+              should_run="true"
+            fi
+          else
+            echo "Trigger event is '${{ github.event_name }}'. Skipping random check. FORCE RUN."
+          fi
+
+          # 将结果输出到 GitHub Actions 变量中，供后续步骤读取
+          echo "should_run=$should_run" >> $GITHUB_OUTPUT
+
+      # ==========================================
+      # 环境配置 (仅当 should_run 为 true 时执行)
+      # ==========================================
       - name: Setup Python
+        if: steps.check_run.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Playwright and browser
+      # 修改：增加了 real-useragent 的安装
+      - name: Install dependencies
+        if: steps.check_run.outputs.should_run == 'true'
         run: |
-          pip install playwright
+          python -m pip install --upgrade pip
+          pip install playwright real-useragent
           python -m playwright install --with-deps chromium
 
+      # ==========================================
+      # 核心运行 (仅当 should_run 为 true 时执行)
+      # ==========================================
       - name: Run Toutiao scraper
+        if: steps.check_run.outputs.should_run == 'true'
         run: |
           echo "===== 开始运行抓取脚本 ====="
-          python scrape_toutiao.py
+          # 这里假设你的脚本文件名是 scrape_toutiao.py，请确保文件名一致
+          python toutiao_pc_crawler.py
           echo "===== 抓取脚本结束 ====="
 
+      # ==========================================
+      # 调试信息 (仅当 should_run 为 true 时执行)
+      # ==========================================
       - name: Show output files (for debug)
+        if: steps.check_run.outputs.should_run == 'true'
         run: |
           echo "===== 仓库文件结构 ====="
           ls -R
-          echo "===== toutiao_links.json 前 80 行内容（如果存在） ====="
+          echo "===== data/toutiao_links.json 前 20 行内容（如果存在） ====="
           if [ -f data/toutiao_links.json ]; then
-            sed -n '1,80p' data/toutiao_links.json
+            sed -n '1,20p' data/toutiao_links.json || cat data/toutiao_links.json
           else
             echo "data/toutiao_links.json 不存在"
           fi
 
       - name: Upload artifacts (debug data)
+        if: steps.check_run.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: toutiao-scrape-debug
           path: |
             data/toutiao_links.json
-            data/debug_toutiao.html
-            data/debug_toutiao.png
+            data/debug/
           if-no-files-found: warn
 
+      # ==========================================
+      # 代码提交 (仅当 should_run 为 true 时执行)
+      # ==========================================
       - name: Commit and push changes
-        # 只有脚本成功跑完时才尝试提交
-        if: success()
+        if: steps.check_run.outputs.should_run == 'true' && success()
         run: |
           echo "===== 检查是否有文件变更需要提交 ====="
           git status --porcelain
@@ -72,7 +126,7 @@ jobs:
           git add data || true
 
           # 提交（可能没有变化就会失败，用 || true 不让整个步骤报错）
-          git commit -m "Update Toutiao links [skip ci]" || echo "没有可提交的变更"
+          git commit -m "Update Toutiao data [skip ci]" || echo "没有可提交的变更"
 
           # 推送到当前分支
           git push
