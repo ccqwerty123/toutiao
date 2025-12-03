@@ -1,11 +1,11 @@
 name: Scrape Toutiao
 
 on:
-  # 1. 手动触发 (调试用，必定执行，不走随机跳过逻辑)
+  # 1. 手动触发（调试用，必定执行，不走随机跳过逻辑）
   workflow_dispatch:
-  
+
   # 2. 定时触发
-  # 北京时间 (UTC+8) 08:00 ~ 23:00，每2小时执行一次
+  # 北京时间 (UTC+8) 08:00 ~ 23:00，每 2 小时执行一次
   # UTC 时间对应：00:00 ~ 15:00
   schedule:
     - cron: '0 0-15/2 * * *'
@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ==========================================
-      # 新增：随机执行判断逻辑
+      # 随机执行判断逻辑
       # ==========================================
       - name: Check Execution Condition (Random Skip)
         id: check_run
@@ -60,13 +60,34 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 修改：增加了 real-useragent 的安装
       - name: Install dependencies
         if: steps.check_run.outputs.should_run == 'true'
         run: |
+          # 关键：统一用当前 python 对应的 pip
           python -m pip install --upgrade pip
-          pip install playwright real-useragent
+          python -m pip install playwright real-useragent
           python -m playwright install --with-deps chromium
+
+      # （可选）验证 real-useragent 是否真能被当前 Python 导入
+      - name: Verify real-useragent
+        if: steps.check_run.outputs.should_run == 'true'
+        run: |
+          python - << 'PY'
+          import sys
+          print("Python:", sys.version)
+          print("Executable:", sys.executable)
+
+          try:
+            import real_useragent
+            print("real_useragent imported OK from:", real_useragent.__file__)
+            from real_useragent import UserAgent
+            ua = UserAgent()
+            print("Sample UA:", ua.desktop_useragent()[:120])
+          except Exception as e:
+            print("real_useragent test FAILED:", repr(e))
+            # 如不想因 UA 库失败而整个流程失败，可去掉下面这行
+            # raise
+          PY
 
       # ==========================================
       # 核心运行 (仅当 should_run 为 true 时执行)
@@ -75,7 +96,6 @@ jobs:
         if: steps.check_run.outputs.should_run == 'true'
         run: |
           echo "===== 开始运行抓取脚本 ====="
-          # 这里假设你的脚本文件名是 scrape_toutiao.py，请确保文件名一致
           python scrape_toutiao.py
           echo "===== 抓取脚本结束 ====="
 
@@ -122,11 +142,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 把 data 目录下变更都加进来（包括新文件）
           git add data || true
-
-          # 提交（可能没有变化就会失败，用 || true 不让整个步骤报错）
           git commit -m "Update Toutiao data [skip ci]" || echo "没有可提交的变更"
-
-          # 推送到当前分支
           git push
