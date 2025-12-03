@@ -5,7 +5,7 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-# 这里换成你的主页地址（可以先不用 ?wid 参数，让前端自己加）
+# 改成你的主页地址
 TOUTIAO_URL = "https://www.toutiao.com/c/user/token/CiyRLPHkUyTCD9FmHodOGQVcmZh5-NRKyfiTSF0XMms-tSja0FdhrUWRp-T-DBpJCjwAAAAAAAAAAAAAT8lExjCbDHcWTgszQQjqU0Ohh9qtuXbuEOe6CQdqJEZ7yIpoM-NJ93_Sty1iMpOe_FUQ9ZmDDhjDxYPqBCIBA9GPpzc="
 
 OUTPUT_DIR = Path("data")
@@ -18,7 +18,6 @@ RAW_HTML = OUTPUT_DIR / "raw_goto_response.html"
 
 async def main():
     async with async_playwright() as p:
-        # 尽量伪装成正常桌面浏览器
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -37,25 +36,12 @@ async def main():
         )
         page = await context.new_page()
 
-        # 打印浏览器控制台日志，方便调试
+        # 打印浏览器控制台日志，方便调试 JS 报错
         page.on(
             "console",
             lambda msg: print(f"[BROWSER_CONSOLE] {msg.type}: {msg.text}")
         )
 
-        # 打印关键接口返回情况（只打印含 user/feed 的）
-        async def log_response(response):
-            url = response.url
-            if "api/pc/list/user/feed" in url:
-                try:
-                    status = response.status
-                    print(f"[XHR] {status} {url}")
-                except Exception:
-                    pass
-
-        page.on("response", log_response)
-
-        # 先访问一次首页，很多站点会在这里发 cookie（比如 ttwid）
         print("[INFO] 先访问 toutiao 首页，获取初始 cookie...")
         home_resp = await page.goto(
             "https://www.toutiao.com/",
@@ -66,7 +52,6 @@ async def main():
             print(f"[INFO] 首页状态码: {home_resp.status}")
         await page.wait_for_timeout(3000)
 
-        # 再访问你的主页
         print(f"[INFO] 打开主页: {TOUTIAO_URL}")
         resp = await page.goto(
             TOUTIAO_URL,
@@ -75,13 +60,12 @@ async def main():
         )
 
         if resp is None:
-            print("[WARN] goto 返回的 Response 是 None，可能是通过 JS 跳转。")
+            print("[WARN] goto 返回的 Response 是 None，可能是通过 JS 重定向。")
         else:
             status = resp.status
             print(f"[INFO] 主页首包状态码: {status}")
             try:
                 text = await resp.text()
-                # 保存一份原始首包 HTML，方便排查（不一定是最终 DOM）
                 RAW_HTML.write_text(text, encoding="utf-8")
                 print("[INFO] 已保存首包 HTML 到:", RAW_HTML)
                 print("[INFO] 首包 HTML 前 400 字符预览：")
@@ -89,7 +73,7 @@ async def main():
             except Exception as e:
                 print("[WARN] 无法读取首包 HTML:", e)
 
-        # 等待网络空闲 + 再多等几秒，给前端 JS 充足时间渲染
+        # 等待网络基本空闲，再多等几秒给 JS 时间
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(5000)
 
@@ -98,60 +82,73 @@ async def main():
         print(f"[INFO] 页面标题: {repr(title)}")
         print(f"[INFO] 当前 URL: {current_url}")
 
-        # 再滚动几次，触发更多内容加载
+        # 向下滚动几次，触发更多内容加载
         for i in range(3):
             print(f"[INFO] 向下滚动第 {i + 1} 次...")
             await page.evaluate(
                 "window.scrollBy(0, document.body.scrollHeight / 2)"
             )
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
-        print("[INFO] 开始从 DOM 中提取文章链接...")
+        print("[INFO] 开始从 DOM 中提取文章链接（p.content > a）...")
 
-        # 提取所有 <a>，筛选出像文章的链接（/article/ 或 /group/）
-        links = await page.eval_on_selector_all(
-            "a",
-            """elements => elements
-                .map(a => ({ href: a.href, text: a.innerText.trim() }))
-                .filter(x =>
-                    x.href &&
-                    (x.href.includes('/article/') || x.href.includes('/group/')) &&
-                    x.text.length > 0
-                )
-            """,
+        # ★ 核心：只抓 <p class="content"><a href="/..."> 这种结构
+        links = await page.evaluate(
+            """
+() => {
+  const anchors = Array.from(
+    document.querySelectorAll("p.content > a[href^='/']")
+  );
+
+  // 路径形如 /某字母/若干数字[/]，例如 /w/1849150482805763/ 或 /z/123456/
+  const pathPattern = /^\\/[a-zA-Z]\\/\\d+\\/?$/;
+
+  const results = [];
+  const seen = new Set();
+
+  for (const a of anchors) {
+    let href = a.getAttribute("href") || "";
+    let text = a.textContent || "";
+    text = text.trim();
+    if (!href || !text) continue;
+
+    const url = new URL(href, window.location.origin);
+    const pathname = url.pathname;
+
+    // 必须符合 /字母/数字 的形式
+    if (!pathPattern.test(pathname)) continue;
+
+    const finalHref = url.href;
+    if (seen.has(finalHref)) continue;
+    seen.add(finalHref);
+
+    results.push({ href: finalHref, text });
+  }
+
+  return results;
+}
+            """
         )
 
-        # 去重
-        seen = set()
-        unique_links = []
-        for l in links:
-            href = l["href"]
-            if href not in seen:
-                seen.add(href)
-                unique_links.append(l)
-
-        print(
-            f"[INFO] 共提取到链接 {len(unique_links)} 条（去重前 {len(links)} 条）。"
-        )
-
-        # 控制台打印前几条
-        for i, item in enumerate(unique_links[:10], start=1):
+        print(f"[INFO] 共提取到链接 {len(links)} 条。")
+        for i, item in enumerate(links[:10], start=1):
             print(f"[DEBUG] #{i} {item['href']}  标题: {item['text'][:50]}")
 
         timestamp = datetime.utcnow().isoformat() + "Z"
         result = {
             "source_url": TOUTIAO_URL,
             "scraped_at": timestamp,
-            "count": len(unique_links),
-            "links": unique_links,
+            "count": len(links),
+            "links": links,
         }
 
         LINKS_FILE.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         print(f"[INFO] 已写入文件: {LINKS_FILE}")
 
-        # 不管有没有抓到，都保存一份最终 DOM 和截图，方便你调试
+        # 保存最终 DOM 和截图，方便以后再排查结构变化
         html_content = await page.content()
         DEBUG_HTML.write_text(html_content, encoding="utf-8")
         await page.screenshot(path=str(DEBUG_PNG), full_page=True)
