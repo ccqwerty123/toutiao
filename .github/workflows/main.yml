@@ -1,0 +1,78 @@
+name: Scrape Toutiao
+
+on:
+  # 手动触发，调试方便
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 允许工作流程向仓库推送变更
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright and browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Run Toutiao scraper
+        run: |
+          echo "===== 开始运行抓取脚本 ====="
+          python scrape_toutiao.py
+          echo "===== 抓取脚本结束 ====="
+
+      - name: Show output files (for debug)
+        run: |
+          echo "===== 仓库文件结构 ====="
+          ls -R
+          echo "===== toutiao_links.json 前 80 行内容（如果存在） ====="
+          if [ -f data/toutiao_links.json ]; then
+            sed -n '1,80p' data/toutiao_links.json
+          else
+            echo "data/toutiao_links.json 不存在"
+          fi
+
+      - name: Upload artifacts (debug data)
+        uses: actions/upload-artifact@v4
+        with:
+          name: toutiao-scrape-debug
+          path: |
+            data/toutiao_links.json
+            data/debug_toutiao.html
+            data/debug_toutiao.png
+          if-no-files-found: warn
+
+      - name: Commit and push changes
+        # 只有脚本成功跑完时才尝试提交
+        if: success()
+        run: |
+          echo "===== 检查是否有文件变更需要提交 ====="
+          git status --porcelain
+
+          # 如果仓库是干净的，直接退出
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "没有文件变更，跳过提交。"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 把 data 目录下变更都加进来（包括新文件）
+          git add data || true
+
+          # 提交（可能没有变化就会失败，用 || true 不让整个步骤报错）
+          git commit -m "Update Toutiao links [skip ci]" || echo "没有可提交的变更"
+
+          # 推送到当前分支
+          git push
