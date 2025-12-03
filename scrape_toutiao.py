@@ -483,23 +483,32 @@ async def run_crawler():
             cooldown = random.randint(3, 8)
             print(f"[COOL] 休息 {cooldown} 秒...")
             await asyncio.sleep(cooldown)
-
+         
         # --- 阶段四：保存结果 ---
-        if read_results:
+        if raw_links:  # 只要提取到了链接就保存
+            all_articles = [
+                {
+                    "title": item["text"],
+                    "url": item["href"],
+                    "scraped_at": datetime.utcnow().isoformat() + "Z"
+                }
+                for item in raw_links
+            ]
+            
             final_data = {
                 "source_url": TOUTIAO_URL,
                 "task_time": datetime.utcnow().isoformat() + "Z",
-                "total_scanned_links": len(raw_links),
-                "read_count": len(read_results),
-                "articles": read_results
+                "total_links": len(raw_links),
+                "articles": all_articles
             }
             
             LINKS_FILE.write_text(json.dumps(final_data, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"[DONE] 数据已保存至 {LINKS_FILE}")
+            print(f"[DONE] 保存 {len(all_articles)} 条链接")
         else:
-            print("[DONE] 本次未成功阅读任何文章，未更新数据文件。")
-
+            print("[DONE] 未提取到任何链接")
+        
         await browser.close()
+
 
 if __name__ == "__main__":
     asyncio.run(run_crawler())
