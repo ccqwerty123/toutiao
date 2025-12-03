@@ -76,7 +76,7 @@ jobs:
         run: |
           echo "===== 开始运行抓取脚本 ====="
           # 这里假设你的脚本文件名是 scrape_toutiao.py，请确保文件名一致
-          python toutiao_pc_crawler.py
+          python scrape_toutiao.py
           echo "===== 抓取脚本结束 ====="
 
       # ==========================================
