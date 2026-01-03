@@ -1,497 +1,793 @@
 import asyncio
+import json
 import random
 import time
+import math
+import sys
 from datetime import datetime
 from pathlib import Path
-from playwright.async_api import async_playwright
 
-# 尝试导入 stealth
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+# ================= 依赖库检测 =================
 try:
+    # 尝试导入 playwright-stealth 增强防爬能力
     from playwright_stealth import stealth_async
     HAS_STEALTH = True
 except ImportError:
     HAS_STEALTH = False
+    print("================================================================")
+    print(f"[WARN] 未安装 playwright-stealth 库。")
+    print(f"[WARN] 建议运行: pip install playwright-stealth 以降低被检测风险。")
+    print("================================================================")
 
-# 配置
+# ================= 配置区域 =================
+
+# 目标用户主页 Token URL (请确保此链接有效)
 TOUTIAO_URL = "https://www.toutiao.com/c/user/token/CiyRLPHkUyTCD9FmHodOGQVcmZh5-NRKyfiTSF0XMms-tSja0FdhrUWRp-T-DBpJCjwAAAAAAAAAAAAAT8lExjCbDHcWTgszQQjqU0Ohh9qtuXbuEOe6CQdqJEZ7yIpoM-NJ93_Sty1iMpOe_FUQ9ZmDDhjDxYPqBCIBA9GPpzc="
-HOME_URL = "https://www.toutiao.com/"
 
-DEBUG_DIR = Path("data/debug_test")
+# 输出设置
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_FILE = DATA_DIR / "toutiao_db.json"
+DEBUG_DIR = DATA_DIR / "debug"
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# 浏览行为限制
+MAX_READ_COUNT = 10     # 每次运行脚本最多阅读多少篇
+MIN_READ_COUNT = 3      # 每次运行脚本最少阅读多少篇
+MAX_SYNC_SCROLLS = 20   # 同步列表时最大下滑次数
+AGING_THRESHOLD = 50    # 文章“老化”阈值
+MAX_RETRIES = 3  # 最大重试次数
 
-# 文章检测JS
-DETECT_ARTICLES_JS = """
+
+# ================= User-Agent 管理 =================
+
+# 内置兜底 PC UA 库 (覆盖主流浏览器与操作系统)
+FALLBACK_PC_UAS = [
+    # Windows 10/11 Chrome
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    # Windows Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    # Mac Chrome
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, Like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    # Mac Safari
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+    # Linux Chrome
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+]
+
+def get_pc_user_agent():
+    """
+    优先使用 real-useragent 库获取随机 PC UA。
+    如果获取失败或库未安装，使用内置列表兜底。
+    """
+    ua = ""
+    try:
+        from real_useragent import UserAgent
+        rua = UserAgent()
+        ua = rua.desktop_useragent()
+        # 简单校验获取的UA是否合法
+        if not ua or len(ua) < 20:
+            raise ValueError("UA too short")
+    except Exception:
+        ua = random.choice(FALLBACK_PC_UAS)
+    
+    return ua
+
+# 常见 PC 分辨率库 (避免单一指纹)
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1280, "height": 720},
+]
+
+# ================= JS 注入脚本 (核心逻辑优化) =================
+# 增强版链接提取脚本：兼容性修复(移除?.) + 增强标题提取 + 过滤词更新
+EXTRACT_LINKS_JS = r"""
 () => {
-    const result = {
-        title: document.title,
-        url: location.href,
-        bodyHeight: document.body.scrollHeight,
-        bodyTextLength: document.body.innerText.length,
-        bodyTextPreview: document.body.innerText.substring(0, 300),
-        
-        allLinks: document.querySelectorAll('a').length,
-        articleLinks: 0,
-        
-        feedCards: document.querySelectorAll('.feed-card-wrapper, .feed-card, .article-card, [class*="feed-card"]').length,
-        userInfo: document.querySelectorAll('.user-info, .author-info, [class*="user-name"]').length,
-        
-        mainContent: null,
-        contentHeight: 0,
-        
-        hasError: false,
-        errorMessage: "",
-        
-        articleTitles: [],
-        allClassNames: []
-    };
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const origin = window.location.origin;
+  const results = [];
+  const seen = new Set();
+  
+  // 1. 路径特征判断
+  const isArticle = (path) => {
+    if (!path) return false;
+    if (path.startsWith("/c/user/")) return false;
+    if (path.startsWith("/search/")) return false;
+    if (path.includes("toutiao_search")) return false;
+
+    const lastPart = path.split("/").filter(Boolean).pop();
+    if (!lastPart) return false;
+    const digits = lastPart.replace(/\D/g, "").length;
+    return digits > 5;
+  };
+
+  // 2. 基础文本提取
+  const getText = (el) => {
+    if (!el) return "";
+    let txt = (el.innerText || "").trim();
+    if (txt) return txt;
     
-    // 收集所有class名（用于分析页面结构）
-    const allElements = document.querySelectorAll('*');
-    const classSet = new Set();
-    allElements.forEach(el => {
-        if (el.className && typeof el.className === 'string') {
-            el.className.split(' ').forEach(c => {
-                if (c && c.length > 3) classSet.add(c);
-            });
+    txt = (el.getAttribute("aria-label") || "").trim();
+    if (txt) return txt;
+    
+    txt = (el.getAttribute("title") || "").trim();
+    if (txt) return txt;
+    
+    const img = el.querySelector("img");
+    if (img) {
+        txt = (img.getAttribute("alt") || "").trim();
+    }
+    return txt;
+  };
+
+  // 3. 截取文本
+  const truncateText = (text, maxLength = 50) => {
+    if (!text || text.length <= maxLength) return text;
+    return text.substring(0, maxLength) + "...";
+  };
+
+  // 4. 获取内容类型
+  const getContentType = (url) => {
+    if (url.includes("/article/")) return "article";
+    if (url.includes("/w/")) return "weitoutiao";
+    if (url.includes("/video/")) return "video";
+    return "unknown";
+  };
+
+  // 5. 增强的标题提取
+  const extractTitle = (a, urlObj) => {
+    let text = getText(a);
+    const contentType = getContentType(urlObj.pathname);
+
+    // 如果直接获取失败或文本太短，尝试更多方法
+    if (!text || text.length < 4) {
+        let container = a.closest('.feed-card-wrapper, .article-card, .feed-card-article-wrapper, .card-wrapper, .weitoutiao-wrap, .wtt-content');
+        
+        // --- 兼容性修改：不使用 ?. 操作符 ---
+        if (!container) {
+            if (a.parentElement && a.parentElement.parentElement && a.parentElement.parentElement.parentElement) {
+                container = a.parentElement.parentElement.parentElement;
+            }
         }
-    });
-    result.allClassNames = Array.from(classSet).slice(0, 50);
-    
-    // 检测文章链接
-    const anchors = document.querySelectorAll('a[href]');
-    for (const a of anchors) {
-        const href = a.getAttribute('href') || '';
-        if (href.includes('/article/') || href.includes('/w/') || href.includes('/video/')) {
-            result.articleLinks++;
-            const text = (a.innerText || a.textContent || '').trim();
-            if (text && text.length > 4 && text.length < 100 && result.articleTitles.length < 10) {
-                result.articleTitles.push(text.substring(0, 60));
+
+        if (container) {
+            // 微头条策略
+            if (contentType === "weitoutiao") {
+                const contentEl = container.querySelector('.weitoutiao-content, .wtt-content, .feed-card-article-content, [class*="content"]');
+                if (contentEl) {
+                    const content = contentEl.innerText.trim();
+                    if (content) {
+                        text = truncateText(content, 40);
+                    }
+                }
+            } 
+            // 视频策略
+            else if (contentType === "video") {
+                const titleEl = container.querySelector('.video-title, .title, [class*="title"]');
+                if (titleEl) {
+                    const t = titleEl.innerText.trim();
+                    if (t) text = t;
+                }
+            }
+
+            // 通用标题查找
+            if (!text || text.length < 4) {
+                const selectors = [
+                    '.title', '.feed-card-article-title', '.article-title', '.feed-card-article-l a',
+                    '[class*="title"]', 'h1, h2, h3', '.text', 'p'
+                ];
+
+                for (const selector of selectors) {
+                    const el = container.querySelector(selector);
+                    if (el) {
+                        const t = el.innerText.trim();
+                        if (t && t.length > 4) {
+                            text = truncateText(t, 50);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 最后尝试：获取容器内第一个长文本
+            if (!text || text.length < 4) {
+                const allTexts = container.innerText.trim().split('\n').filter(t => t.trim().length > 4);
+                if (allTexts.length > 0) {
+                    text = truncateText(allTexts[0], 50);
+                }
             }
         }
     }
-    
-    // 检测主内容区域
-    const contentSelectors = [
-        '.feed-list', '.article-list', '.user-article-list',
-        '.ugc-list', 'main', '.main-content', '.user-content'
-    ];
-    for (const sel of contentSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-            result.mainContent = sel;
-            result.contentHeight = el.scrollHeight;
-            break;
-        }
+
+    // 兜底重命名
+    if (!text || text === "Untitled") {
+        if (contentType === "weitoutiao") text = "[微头条]";
+        else if (contentType === "video") text = "[视频]";
     }
+
+    return { text: text || "Untitled", contentType };
+  };
+
+  // 主循环
+  for (const a of anchors) {
+    let href = a.getAttribute("href");
+    if (!href) continue;
     
-    // 错误检测
-    const bodyText = document.body.innerText;
-    if (bodyText.includes('404') || bodyText.includes('页面不存在')) {
-        result.hasError = true;
-        result.errorMessage = "404";
-    }
-    if (bodyText.includes('验证') || bodyText.includes('captcha')) {
-        result.hasError = true;
-        result.errorMessage = "验证码";
-    }
+    if (href.startsWith("/")) href = origin + href;
     
-    return result;
+    try {
+        const urlObj = new URL(href);
+        
+        if (!urlObj.hostname.includes("toutiao.com")) continue;
+        if (!isArticle(urlObj.pathname)) continue;
+        
+        const cleanUrl = urlObj.origin + urlObj.pathname;
+        if (seen.has(cleanUrl)) continue;
+
+        const titleInfo = extractTitle(a, urlObj);
+        let text = titleInfo.text;
+
+        // 关键词过滤 (已添加'侵权举报受理公示')
+        const filterKeywords = [
+            '跟帖评论自律管理承诺书',
+            '用户协议',
+            '隐私政策',
+            '侵权投诉',
+            '网络谣言曝光台',
+            '违法和不良信息举报',
+            '侵权举报受理公示'
+        ];
+        
+        if (filterKeywords.some(keyword => text.includes(keyword))) continue;
+
+        // 额外的短词过滤
+        if (!text.startsWith('[') && text.match(/^(备案|举报|登录|下载|广告|相关推荐|搜索)$/)) continue;
+        
+        seen.add(cleanUrl);
+        results.push({ 
+            text: text, 
+            href: cleanUrl,
+            type: titleInfo.contentType
+        });
+
+    } catch(e) {}
+  }
+
+  return results;
 }
 """
 
-def print_result(result, test_name):
-    """打印检测结果"""
-    if not result:
-        print("   ❌ 检测失败，无结果")
-        return
-    
-    print(f"\n   📊 检测结果:")
-    print(f"   ├─ 页面标题: {result['title']}")
-    print(f"   ├─ 页面高度: {result['bodyHeight']}px")
-    print(f"   ├─ 文本长度: {result['bodyTextLength']} 字符")
-    print(f"   ├─ 总链接数: {result['allLinks']}")
-    print(f"   ├─ 文章链接: {result['articleLinks']} ⬅️ {'✅' if result['articleLinks'] > 0 else '❌ 关键指标!'}")
-    print(f"   ├─ Feed卡片: {result['feedCards']}")
-    print(f"   ├─ 内容区域: {result['mainContent']} (高度: {result['contentHeight']}px)")
-    print(f"   ├─ 检测错误: {result['hasError']} {result['errorMessage']}")
-    
-    if result['articleTitles']:
-        print(f"   ├─ 文章标题样本:")
-        for i, title in enumerate(result['articleTitles'][:5], 1):
-            print(f"   │    {i}. {title}")
-    else:
-        print(f"   ├─ ⚠️ 未检测到任何文章标题!")
-    
-    # 显示部分class名用于调试
-    if result['articleLinks'] == 0:
-        print(f"   └─ 页面class样本: {result['allClassNames'][:15]}")
+# ================= 数据库管理类 =================
 
+class ArticleDB:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.data = self._load()
 
-async def save_debug_files(page, test_name):
-    """保存截图和HTML"""
-    try:
-        await page.screenshot(path=DEBUG_DIR / f"{test_name}.png", full_page=False)
-        html = await page.content()
-        (DEBUG_DIR / f"{test_name}.html").write_text(html, encoding='utf-8')
-        print(f"   📸 已保存: {test_name}.png / .html")
-    except Exception as e:
-        print(f"   ⚠️ 保存文件失败: {e}")
-
-
-async def detect(page, test_name):
-    """检测并保存"""
-    result = await page.evaluate(DETECT_ARTICLES_JS)
-    print_result(result, test_name)
-    await save_debug_files(page, test_name)
-    return result
-
-
-# ============= 测试用例 =============
-
-async def test_01_direct_domcontentloaded():
-    """测试1: 直接访问，domcontentloaded"""
-    print("\n" + "="*60)
-    print("🧪 测试1: 直接访问用户主页 (wait=domcontentloaded)")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        print("   → 直接goto用户主页...")
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        print("   → 等待3秒...")
-        await asyncio.sleep(3)
-        
-        result = await detect(page, "test01")
-        await browser.close()
-        return result
-
-
-async def test_02_direct_networkidle():
-    """测试2: 直接访问，networkidle"""
-    print("\n" + "="*60)
-    print("🧪 测试2: 直接访问用户主页 (wait=networkidle)")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        print("   → 直接goto用户主页 (networkidle可能较慢)...")
+    def _load(self):
+        if not self.db_path.exists():
+            return {"last_sync_date": "", "articles": {}}
         try:
-            await page.goto(TOUTIAO_URL, wait_until="networkidle", timeout=60000)
+            return json.loads(self.db_path.read_text(encoding="utf-8"))
         except Exception as e:
-            print(f"   ⚠️ 超时: {e}")
+            print(f"[DB] 读取数据库出错: {e}，将初始化新库")
+            return {"last_sync_date": "", "articles": {}}
+
+    def save(self):
+        try:
+            self.db_path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"[DB] 保存失败: {e}")
+
+    def needs_sync(self) -> bool:
+        """判断今天是否已经执行过全量抓取"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        return self.data.get("last_sync_date") != today
+
+    def mark_synced(self):
+        self.data["last_sync_date"] = datetime.now().strftime("%Y-%m-%d")
+        self.save()
+
+    def add_articles(self, scraped_items: list):
+        """增量添加文章"""
+        added_count = 0
+        current_urls = self.data["articles"]
         
-        result = await detect(page, "test02")
-        await browser.close()
-        return result
+        for item in scraped_items:
+            url = item['href']
+            # 如果是新链接，或者旧链接是Untitled但这次抓到了真标题，则更新
+            if url not in current_urls:
+                current_urls[url] = {
+                    "title": item['text'],
+                    "url": url,
+                    "status": "active",
+                    "last_read_at": "",
+                    "read_count": 0
+                }
+                added_count += 1
+            elif current_urls[url]["title"] == "Untitled" and item['text'] != "Untitled":
+                 current_urls[url]["title"] = item['text'] # 修正标题
+        
+        print(f"[DB] 数据库更新: 新增 {added_count} 篇，当前总库存 {len(current_urls)} 篇")
+        self.save()
 
+    def mark_invalid(self, url):
+        """标记失效"""
+        if url in self.data["articles"]:
+            self.data["articles"][url]["status"] = "invalid"
+            print(f"[DB] 链接标记为无效: {url}")
+            self.save()
 
-async def test_03_warmup_new_page():
-    """测试3: 首页热身 → 关闭 → 新Page访问"""
-    print("\n" + "="*60)
-    print("🧪 测试3: 首页热身后，新Page访问用户主页")
-    print("="*60)
+    def record_read(self, url):
+        """记录阅读"""
+        if url in self.data["articles"]:
+            today = datetime.now().strftime("%Y-%m-%d")
+            entry = self.data["articles"][url]
+            entry["last_read_at"] = today
+            entry["read_count"] = entry.get("read_count", 0) + 1
+            self.save()
+
+    def get_weighted_candidates(self) -> list:
+        """获取今日阅读列表：权重算法"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        candidates = []
+        weights = []
+        
+        active_urls = [k for k, v in self.data["articles"].items() if v.get("status") == "active"]
+        
+        for url in active_urls:
+            info = self.data["articles"][url]
+            
+            # 规则1: 今天读过的绝对不读
+            if info.get("last_read_at") == today:
+                continue
+            
+            read_count = info.get("read_count", 0)
+            
+            # 规则2: 权重计算
+            # 没读过的(0次): 极高权重 200
+            # 读得少的(<5次): 高权重 100
+            # 普通(<20次): 中权重 50
+            # 老旧(>50次): 低权重 5 (保留微小概率)
+            if read_count == 0:
+                w = 200
+            elif read_count < 5:
+                w = 100
+            elif read_count < 20:
+                w = 50
+            elif read_count < AGING_THRESHOLD:
+                w = 20
+            else:
+                w = 5
+            
+            candidates.append(info)
+            weights.append(w)
+            
+        if not candidates:
+            return []
+
+        # 无放回抽取
+        target_k = random.randint(MIN_READ_COUNT, MAX_READ_COUNT)
+        target_k = min(target_k, len(candidates))
+        
+        print(f"[PLAN] 可选文章库: {len(candidates)} 篇. 计划阅读: {target_k} 篇")
+        
+        selected = []
+        temp_cand = list(candidates)
+        temp_weight = list(weights)
+        
+        for _ in range(target_k):
+            if not temp_cand: break
+            chosen = random.choices(temp_cand, weights=temp_weight, k=1)[0]
+            selected.append(chosen)
+            
+            idx = temp_cand.index(chosen)
+            temp_cand.pop(idx)
+            temp_weight.pop(idx)
+            
+        return selected
+
+# ================= 拟人化操作函数 =================
+
+async def human_delay(min_s=1.0, max_s=3.0):
+    """带随机性的等待"""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+async def human_mouse_move(page: Page, x_target, y_target, steps=25):
+    """贝塞尔曲线模拟鼠标移动"""
+    try:
+        start_x = random.randint(100, 1000)
+        start_y = random.randint(100, 600)
+        
+        ctrl_x1 = start_x + (x_target - start_x) * 0.3 + random.randint(-50, 50)
+        ctrl_y1 = start_y + (y_target - start_y) * 0.3 + random.randint(-50, 50)
+        ctrl_x2 = start_x + (x_target - start_x) * 0.7 + random.randint(-50, 50)
+        ctrl_y2 = start_y + (y_target - start_y) * 0.7 + random.randint(-50, 50)
+
+        for i in range(steps + 1):
+            t = i / steps
+            x = (1-t)**3 * start_x + 3*(1-t)**2 * t * ctrl_x1 + 3*(1-t)*t**2 * ctrl_x2 + t**3 * x_target
+            y = (1-t)**3 * start_y + 3*(1-t)**2 * t * ctrl_y1 + 3*(1-t)*t**2 * ctrl_y2 + t**3 * y_target
+            
+            # 抖动
+            x += random.uniform(-2, 2)
+            y += random.uniform(-2, 2)
+            
+            await page.mouse.move(x, y)
+            await asyncio.sleep(random.uniform(0.005, 0.015))
+    except Exception:
+        pass
+
+async def human_scroll(page: Page, max_scrolls=1):
+    """拟人化滚动"""
+    for _ in range(max_scrolls):
+        # 随机滚动幅度
+        delta_y = random.randint(300, 700)
+        await page.mouse.wheel(0, delta_y)
+        
+        # 滚动后的停顿，模拟阅读
+        await human_delay(1.0, 2.5)
+        
+        # 20% 概率回滚 (回看)
+        if random.random() < 0.2:
+            await page.mouse.wheel(0, -random.randint(100, 250))
+            await human_delay(0.5, 1.2)
+
+async def check_captcha(page: Page, tag="unknown") -> bool:
+    """检查验证码，并截图（覆盖最新一份）"""
+    try:
+        title = await page.title()
+        is_captcha = False
+        
+        # 1. 标题判断
+        if any(kw in title for kw in ["验证", "安全检测", "captcha", "verify"]):
+            is_captcha = True
+            
+        # 2. DOM 判断
+        if not is_captcha:
+            if await page.query_selector("#captcha-verify-image") or \
+               await page.query_selector(".captcha_verify_container"):
+                is_captcha = True
+        
+        if is_captcha:
+            print(f"[ALERT] {tag} 阶段检测到验证码! Title: {title}")
+            # 保存验证码截图，覆盖旧的同类型文件
+            screenshot_path = DEBUG_DIR / f"captcha_{tag}_latest.png"
+            await page.screenshot(path=screenshot_path)
+            print(f"[ALERT] 验证码截图已保存: {screenshot_path}")
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"[WARN] 验证码检测出错: {e}")
+        return False
+
+# ================= 核心任务逻辑 =================
+
+async def sync_task(context: BrowserContext, db: ArticleDB):
+    """
+    全量同步任务：混合方案 (networkidle + 辅助滚动)
+    流程：主页热身 -> 用户主页 -> 等待加载 -> 下滑提取 -> 成功后清理旧错误
+    """
+    print(">>> [SYNC] 开始执行全量同步任务...")
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        
-        print("   → 创建Page访问首页...")
-        warmup = await context.new_page()
-        await warmup.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        print("   → 首页停留5秒...")
-        await asyncio.sleep(5)
-        await warmup.close()
-        print("   → 关闭热身Page，创建新Page访问用户主页...")
-        
+    # 循环尝试 MAX_RETRIES 次
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f">>> [SYNC] 第 {attempt}/{MAX_RETRIES} 次尝试连接...")
         page = await context.new_page()
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(3)
+        if HAS_STEALTH: await stealth_async(page)
         
-        result = await detect(page, "test03")
-        await browser.close()
-        return result
+        try:
+            # 1. 访问今日头条主页 (热身)
+            print("[SYNC] 正在访问主页热身...")
+            await page.goto("https://www.toutiao.com/", wait_until="domcontentloaded", timeout=45000)
+            await human_delay(2, 4)
+            
+            # 2. 访问目标用户主页 (关键步骤)
+            print("[SYNC] 跳转至目标用户主页...")
+            # 使用 networkidle 确保大部分资源加载完毕
+            await page.goto(TOUTIAO_URL, wait_until="networkidle", timeout=60000)
+            await human_delay(3, 5)
+            
+            # 3. 验证码检查
+            if await check_captcha(page, f"sync_try_{attempt}"):
+                print(f"[SYNC] 第 {attempt} 次遭遇验证码，稍后重试...")
+                raise Exception("Captcha detected")
 
+            articles_found = False
+            links = []
+            
+            # 4. 辅助下滑尝试 (即使 networkidle 了，也可能需要触发懒加载)
+            print("[SYNC] 正在模拟下滑加载内容...")
+            last_height = await page.evaluate("document.body.scrollHeight")
+            
+            # 混合方案：即使加载好了，也习惯性滑动几下，模拟真实用户查看
+            scroll_times = random.randint(8, 12)
+            for i in range(scroll_times):
+                await human_scroll(page, max_scrolls=1)
+                await human_delay(1, 1.5)
+                
+                # 每滑动几次检查一下有没有新内容，更新高度
+                if i % 3 == 0:
+                    new_height = await page.evaluate("document.body.scrollHeight")
+                    last_height = new_height
+            
+            # 等待渲染
+            await human_delay(2, 3)
+            
+            # 5. 提取链接
+            print("[SYNC] 执行 JS 提取链接...")
+            links = await page.evaluate(EXTRACT_LINKS_JS)
+            
+            if links and len(links) > 0:
+                print(f"[SYNC] 成功发现 {len(links)} 篇文章")
+                articles_found = True
+            else:
+                print(f"[SYNC] 第 {attempt} 次尝试未发现文章")
+            
+            # 6. 结果判断
+            if articles_found and links:
+                # --- 成功路径 ---
+                db.add_articles(links)
+                db.mark_synced()
+                
+                print(f"[SYNC] 同步成功 (在第 {attempt} 次尝试，共 {len(links)} 篇文章)")
+                
+                # ============ 清理旧的错误截图 ============
+                print("[SYNC] 清理旧的调试/错误文件...")
+                try:
+                    # 删除旧的同步错误截图，防止混淆
+                    for file_path in DEBUG_DIR.glob("error_sync_*.png"):
+                        file_path.unlink(missing_ok=True)
+                    for file_path in DEBUG_DIR.glob("debug_sync_fail_*.png"):
+                        file_path.unlink(missing_ok=True)
+                    for file_path in DEBUG_DIR.glob("sync_source_*.html"):
+                         file_path.unlink(missing_ok=True)
+                    print("[SYNC] 清理完成。")
+                except Exception as clean_err:
+                    print(f"[WARN] 清理文件失败: {clean_err}")
+                # ========================================
 
-async def test_04_warmup_same_page():
-    """测试4: 首页热身 → 同一Page跳转 (模拟旧代码)"""
-    print("\n" + "="*60)
-    print("🧪 测试4: 首页热身后，同一Page跳转用户主页 ⬅️ 旧代码模式")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        print("   → 访问首页...")
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        print("   → 首页停留5秒...")
-        await asyncio.sleep(5)
-        
-        print("   → 同一Page跳转用户主页...")
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(3)
-        
-        result = await detect(page, "test04")
-        await browser.close()
-        return result
+                await page.close()
+                return  # 成功结束
+            else:
+                # --- 失败路径 ---
+                print(f"[WARN] 第 {attempt} 次尝试未能提取到文章")
+                # 保存失败截图
+                await page.screenshot(path=DEBUG_DIR / f"debug_sync_fail_attempt_{attempt}.png")
+                if attempt < MAX_RETRIES:
+                    raise Exception("No links extracted")
 
-
-async def test_05_scroll_15_times():
-    """测试5: 强制滚动15次"""
-    print("\n" + "="*60)
-    print("🧪 测试5: 同一Page跳转 + 强制滚动15次")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(3)
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        
-        print("   → 初始状态:")
-        await detect(page, "test05_before")
-        
-        print("   → 强制滚动15次...")
-        for i in range(15):
-            await page.mouse.wheel(0, 500)
-            await asyncio.sleep(1.5)
-        
-        print("   → 滚动后状态:")
-        result = await detect(page, "test05_after")
-        await browser.close()
-        return result
-
-
-async def test_06_wait_for_selector():
-    """测试6: 等待特定选择器"""
-    print("\n" + "="*60)
-    print("🧪 测试6: 尝试wait_for_selector等待文章元素")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(3)
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        
-        selectors = [
-            'a[href*="/article/"]',
-            'a[href*="/w/"]',
-            '.feed-card-wrapper',
-            '.feed-card',
-            '[class*="feed"]',
-            '[class*="article"]',
-        ]
-        
-        for sel in selectors:
+        except Exception as e:
+            print(f"[SYNC] 第 {attempt} 次尝试失败: {e}")
+            
+            # 保存错误截图
             try:
-                print(f"   → 等待: {sel} ...")
-                await page.wait_for_selector(sel, timeout=8000)
-                print(f"      ✅ 找到!")
-                break
-            except:
-                print(f"      ❌ 超时未找到")
+                await page.screenshot(path=DEBUG_DIR / f"error_sync_attempt_{attempt}.png")
+            except: pass
+            
+            if attempt == MAX_RETRIES:
+                print("[FATAL] 全量同步任务最终失败。")
+                # 保存最终HTML
+                try:
+                    debug_html_path = DEBUG_DIR / "sync_source_final_fail.html"
+                    content = await page.content()
+                    debug_html_path.write_text(content, encoding="utf-8")
+                except: pass
+            else:
+                wait_time = random.randint(5, 10)
+                print(f"[WAIT] 等待 {wait_time} 秒后重试...")
+                await asyncio.sleep(wait_time)
         
-        result = await detect(page, "test06")
-        await browser.close()
-        return result
-
-
-async def test_07_with_stealth():
-    """测试7: 使用stealth"""
-    print("\n" + "="*60)
-    print("🧪 测试7: 使用 playwright-stealth")
-    print("="*60)
+        finally:
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except: pass
     
-    if not HAS_STEALTH:
-        print("   ⚠️ 未安装stealth，跳过")
-        return None
+    print("[SYNC] 全量同步任务完全失败")
+
+async def read_article_task(context: BrowserContext, article: dict, db: ArticleDB):
+    """
+    单篇阅读任务：包含优化的时长算法
+    流程：主页热身 -> 用户主页 -> 文章页 (模拟从作者主页点击进入) -> 截图存档 -> 阅读 -> 结束
+    """
+    url = article['url']
+    title_preview = article['title'][:20]
+    print(f"--- [READ] 准备阅读: {title_preview}... ---")
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        await stealth_async(page)
-        
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(3)
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
-        
-        result = await detect(page, "test07")
-        await browser.close()
-        return result
+    page = await context.new_page()
+    if HAS_STEALTH: await stealth_async(page)
 
+    try:
+        # 1. 访问主页 (模拟用户打开APP/网站)
+        print("[READ] 步骤1: 访问主页...")
+        await page.goto("https://www.toutiao.com/", wait_until="domcontentloaded", timeout=30000)
+        await human_delay(1.5, 3)
 
-async def test_08_long_wait_30s():
-    """测试8: 超长等待30秒"""
-    print("\n" + "="*60)
-    print("🧪 测试8: 超长等待30秒（测试是否需要更多时间）")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        
-        print("   → 等待30秒...")
-        for i in range(6):
-            await asyncio.sleep(5)
-            print(f"      已等待 {(i+1)*5} 秒...")
-        
-        result = await detect(page, "test08")
-        await browser.close()
-        return result
+        # 2. 访问作者主页 (模拟点击头像进入)
+        print("[READ] 步骤2: 进入作者主页...")
+        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=45000)
+        await human_delay(2, 4)
 
+        # 3. 进入具体文章页
+        print(f"[READ] 步骤3: 打开文章页面...")
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        
+        # 4. 验证码与404检查
+        await human_delay(2, 3)
+        if await check_captcha(page, "read"):
+            return
 
-async def test_09_monitor_network():
-    """测试9: 监控网络请求"""
-    print("\n" + "="*60)
-    print("🧪 测试9: 监控API网络请求")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-        
-        api_requests = []
-        api_responses = []
-        
-        def on_request(req):
-            url = req.url
-            if any(k in url for k in ['api', 'feed', 'list', 'article', 'user']):
-                api_requests.append(url)
-        
-        def on_response(resp):
-            url = resp.url
-            if any(k in url for k in ['api', 'feed', 'list', 'article', 'user']):
-                api_responses.append({'url': url, 'status': resp.status})
-        
-        page.on('request', on_request)
-        page.on('response', on_response)
-        
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(10)
-        
-        print(f"\n   📡 API请求 ({len(api_requests)} 个):")
-        for url in api_requests[:8]:
-            print(f"      → {url[:90]}...")
-        
-        print(f"\n   📡 API响应 ({len(api_responses)} 个):")
-        for r in api_responses[:8]:
-            status_icon = "✅" if r['status'] == 200 else "❌"
-            print(f"      {status_icon} [{r['status']}] {r['url'][:80]}...")
-        
-        # 保存完整日志
-        with open(DEBUG_DIR / "test09_network.log", "w", encoding="utf-8") as f:
-            f.write("=== REQUESTS ===\n")
-            for url in api_requests:
-                f.write(url + "\n")
-            f.write("\n=== RESPONSES ===\n")
-            for r in api_responses:
-                f.write(f"[{r['status']}] {r['url']}\n")
-        
-        result = await detect(page, "test09")
-        await browser.close()
-        return result
+        # ============ 增加：文章打开验证截图 ============
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 简单的序号命名，方便查看
+        screenshot_name = f"read_verify_{timestamp_str}.png"
+        await page.screenshot(path=DEBUG_DIR / screenshot_name)
+        print(f"[READ] 已保存阅读验证截图: {screenshot_name}")
+        # ==============================================
 
-
-async def test_10_different_viewport():
-    """测试10: 不同视窗大小"""
-    print("\n" + "="*60)
-    print("🧪 测试10: 使用较小视窗 1366x768")
-    print("="*60)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent=DEFAULT_UA, 
-            viewport={"width": 1366, "height": 768}
-        )
-        page = await context.new_page()
+        page_content = await page.evaluate("document.body.innerText")
+        page_title = await page.title()
         
-        await page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(3)
-        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
+        # 简易的失效判断
+        invalid_keywords = ["404", "页面不存在", "文章已删除", "参数错误"]
+        if any(k in page_title for k in invalid_keywords):
+            print("[READ] 文章已失效，标记 invalid。")
+            db.mark_invalid(url)
+            return
+
+        # =========================================================
+        # 核心修改：优化阅读时长计算算法
+        # 目标：30s ~ 180s 自然分布，避免一刀切
+        # =========================================================
         
-        result = await detect(page, "test10")
-        await browser.close()
-        return result
+        # 1. 字数统计
+        word_count = len(page_content)
+        
+        # 2. 图片数量统计
+        img_count = await page.evaluate("""
+            () => {
+                const imgs = document.querySelectorAll('article img, .tt-input__content img, .article-content img, .pgc-img img');
+                return imgs.length;
+            }
+        """)
 
+        # 3. 计算基准时长
+        text_time = word_count / 25.0  
+        img_time = img_count * 5.0
+        base_time = text_time + img_time
+        
+        if base_time < 10:
+            base_time = random.randint(20, 40)
+        
+        # 4. 增加随机扰动
+        variation = random.gauss(1.0, 0.2)
+        thinking_time = random.uniform(5, 15)
+        
+        # 计算总时长
+        calc_seconds = (base_time * variation) + thinking_time
+        read_seconds = max(30.0, calc_seconds)
+        read_seconds = min(180.0, read_seconds)
+        
+        print(f"[READ] 字数:{word_count} | 图片:{img_count} | 算法计算:{calc_seconds:.1f}s")
+        print(f"[READ] >> 最终计划停留: {read_seconds:.1f}秒")
+        
+        # =========================================================
 
-# ============= 主程序 =============
+        # 交互循环
+        start_read = time.time()
+        while (time.time() - start_read) < read_seconds:
+            # 随机下滑
+            await human_scroll(page, max_scrolls=1)
+            
+            # 随机鼠标移动
+            if random.random() < 0.3:
+                await human_mouse_move(page, random.randint(200, 1000), random.randint(300, 800))
+            
+            # 极低概率模拟选中文本
+            if random.random() < 0.1:
+                try:
+                    await page.click("p", timeout=200)
+                except: pass
+
+        # 必须动作：滑动到底部
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await human_delay(1.5, 3.0)
+        
+        # 成功完成
+        print(f"[READ] 阅读完成。")
+        db.record_read(url)
+
+    except Exception as e:
+        print(f"[READ] 异常: {e}")
+        await page.screenshot(path=DEBUG_DIR / "error_read_latest.png")
+    finally:
+        await page.close()
+
+# ================= 主程序入口 =================
 
 async def main():
-    print("="*60)
-    print("🔍 头条用户主页加载诊断工具")
-    print(f"⏰ 测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🎯 目标URL: {TOUTIAO_URL[:60]}...")
-    print(f"📁 输出目录: {DEBUG_DIR}")
-    print(f"🛡️ Stealth: {'可用' if HAS_STEALTH else '不可用'}")
-    print("="*60)
+    # 1. 准备工作
+    db = ArticleDB(DB_FILE)
     
-    all_results = {}
+    # 随机选择视窗
+    vp = random.choice(VIEWPORTS)
+    # 获取随机 UA
+    ua = get_pc_user_agent()
     
-    tests = [
-        ("01_直接访问_domcontentloaded", test_01_direct_domcontentloaded),
-        ("02_直接访问_networkidle", test_02_direct_networkidle),
-        ("03_热身后_新Page", test_03_warmup_new_page),
-        ("04_热身后_同Page跳转", test_04_warmup_same_page),
-        ("05_强制滚动15次", test_05_scroll_15_times),
-        ("06_等待选择器", test_06_wait_for_selector),
-        ("07_使用stealth", test_07_with_stealth),
-        ("08_超长等待30秒", test_08_long_wait_30s),
-        ("09_监控网络请求", test_09_monitor_network),
-        ("10_小视窗1366x768", test_10_different_viewport),
-    ]
-    
-    for name, func in tests:
-        try:
-            result = await func()
-            all_results[name] = result
-        except Exception as e:
-            print(f"   ❌ 测试异常: {e}")
-            all_results[name] = None
-        
-        await asyncio.sleep(2)
-    
-    # 汇总
-    print("\n" + "="*60)
-    print("📊 测试结果汇总")
-    print("="*60)
-    
-    for name, result in all_results.items():
-        if result:
-            count = result.get('articleLinks', 0)
-            icon = "✅" if count > 0 else "❌"
-            print(f"   {icon} {name}: 文章链接={count}")
-        else:
-            print(f"   ⚠️ {name}: 无结果")
-    
-    print(f"\n📁 所有文件已保存到: {DEBUG_DIR}")
-    print("请检查截图和HTML文件进行进一步分析")
+    print(f"[INIT] 启动爬虫任务")
+    print(f"[INIT] UA: {ua[:50]}...")
+    print(f"[INIT] Viewport: {vp['width']}x{vp['height']}")
 
+    async with async_playwright() as p:
+        # 启动浏览器
+        # 生产环境保持 headless=True
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled", # 去除自动化特征
+                "--no-sandbox",
+                "--disable-infobars",
+                "--window-size={},{}".format(vp['width'], vp['height'])
+            ]
+        )
+        
+        # 创建上下文
+        context = await browser.new_context(
+            user_agent=ua,
+            viewport=vp,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            device_scale_factor=1,
+            has_touch=False,
+            is_mobile=False,
+            java_script_enabled=True
+        )
+
+        # 注入 webdriver 移除脚本 (双重保险)
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # --- 步骤 1: 检查是否需要全量同步 ---
+        # 如果今天是第一次运行，或者数据库为空，则执行同步
+        if db.needs_sync() or not db.data.get("articles"):
+            await sync_task(context, db)
+        else:
+            print("[INIT] 今日已执行过同步，跳过列表抓取。")
+
+        # --- 步骤 2: 获取今日阅读目标 ---
+        targets = db.get_weighted_candidates()
+        
+        if not targets:
+            print("[DONE] 暂无待读文章 (可能已全部读完或无新内容)。")
+            await browser.close()
+            return
+
+        # --- 步骤 3: 循环阅读 ---
+        # 注意：不再需要单独的首页热身，因为 read_article_task 内部已经包含了流程
+        for i, article in enumerate(targets, 1):
+            print(f"\n>>> 进度 [{i}/{len(targets)}]")
+            await read_article_task(context, article, db)
+            
+            # 篇间冷却时间 (避免操作过快)
+            if i < len(targets):
+                wait_time = random.randint(8, 15)
+                print(f"[COOL] 休息 {wait_time} 秒...")
+                await asyncio.sleep(wait_time)
+
+        await browser.close()
+        print("\n[DONE] 所有任务完成。")
 
 if __name__ == "__main__":
     asyncio.run(main())
