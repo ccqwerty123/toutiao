@@ -477,270 +477,211 @@ async def check_captcha(page: Page, tag="unknown") -> bool:
 
 async def sync_task(context: BrowserContext, db: ArticleDB):
     """
-    全量同步任务 - 优化版
-    核心改动：
-    1. 热身已在 main() 完成，这里直接访问用户主页
-    2. 暂时禁用 stealth（测试证明可能有负面影响）
-    3. 成功后清理旧的错误/调试文件
-    4. 增强的滚动加载策略
+    全量同步任务 - 智能策略优化版
+    
+    逻辑说明:
+    1. 检查 DB 库存:
+       - 如果是初次运行(库存为0)或库存很少(<20): 激活 [深度抓取模式]，尽可能多滑。
+       - 如果库存充足: 激活 [增量更新模式]，滑到一定数量即停止，节省资源。
+    2. 动态调整: 根据模式不同，调整 最大滚动次数(max_scrolls) 和 目标抓取数量(target_count)。
+    3. 兜底机制: 无论哪种模式，如果连续多次滚不到新内容，都会自动停止。
     """
     print(">>> [SYNC] 开始执行全量同步任务...")
+
+    # ================= 策略判定区域 =================
+    current_article_count = len(db.data.get("articles", {}))
     
+    # 判定阈值：如果库存少于 20 篇，视为冷启动/数据不足
+    IS_COLD_START = current_article_count < 20
+    
+    if IS_COLD_START:
+        print(f">>> [STRATEGY] 检测到库存较少 ({current_article_count} 篇)，激活【深度抓取模式】")
+        # 深度模式：滚得深，抓得多
+        MAX_SCROLL_ROUNDS_DYNAMIC = 100   # 此时最大允许滚 100 次
+        TARGET_ARTICLE_COUNT = 300        # 目标抓够 300 篇才停（除非到底）
+    else:
+        print(f">>> [STRATEGY] 检测到库存充足 ({current_article_count} 篇)，激活【增量更新模式】")
+        # 增量模式：滚得浅，只要最新的
+        MAX_SCROLL_ROUNDS_DYNAMIC = 20    # 平时只滚 20 次
+        TARGET_ARTICLE_COUNT = 40         # 只要抓到 40 篇新热文就够了
+    # ===============================================
+
     for attempt in range(1, MAX_RETRIES + 1):
         print(f">>> [SYNC] 第 {attempt}/{MAX_RETRIES} 次尝试连接...")
         page = await context.new_page()
         
-        # ⚠️ 暂时禁用 stealth，测试证明可能导致内容加载失败
-        # if HAS_STEALTH: await stealth_async(page)
-        
         try:
             # ============================================
-            # 🔥 关键：直接访问用户主页，不要热身
-            # 热身已在 main() 中完成
+            # 1. 访问主页
             # ============================================
-            print("[SYNC] 🚀 直接访问目标用户主页...")
-            
-            # 优先使用 networkidle（测试2证明有效）
+            print("[SYNC] 🚀 访问目标用户主页...")
             try:
+                # 优先等待网络空闲，确保 AJAX 内容加载
                 await page.goto(TOUTIAO_URL, wait_until="networkidle", timeout=45000)
-                print("[SYNC] ✓ networkidle 完成")
             except Exception as timeout_err:
-                # networkidle 超时时降级到 domcontentloaded
-                print(f"[SYNC] ⚠ networkidle 超时，尝试降级: {timeout_err}")
-                try:
-                    await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=30000)
-                    print("[SYNC] ✓ domcontentloaded 完成")
-                except:
-                    raise Exception("页面加载完全失败")
+                print(f"[SYNC] ⚠ networkidle 超时，降级等待 DOM: {timeout_err}")
+                await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=30000)
             
-            # 等待页面渲染
+            # 刚加载完，随机发呆几秒，模拟人眼浏览
             await human_delay(4, 6)
             
-            # 验证码检查
+            # 检查是否有验证码
             if await check_captcha(page, f"sync_try_{attempt}"):
-                print(f"[SYNC] 第 {attempt} 次遭遇验证码，稍后重试...")
+                print(f"[SYNC] 第 {attempt} 次遭遇验证码，关闭重试...")
                 raise Exception("Captcha detected")
 
+            # ============================================
+            # 2. 准备滚动
+            # ============================================
             articles_found = False
             links = []
             all_seen_urls = set()
             
-            # ============================================
-            # 滚动加载策略（优化版）
-            # ============================================
-            print("[SYNC] 开始滚动加载内容...")
-            
-            # 先尝试等待文章元素出现
+            # 等待文章列表容器出现 (多种可能的选择器)
+            print("[SYNC] 等待文章列表加载...")
             article_selectors = [
                 'a[href*="/article/"]',
                 'a[href*="/w/"]', 
                 'a[href*="/video/"]',
+                '.feed-card-wrapper', # 头条常见的卡片容器
+                '.profile-feed-card'
             ]
             
+            element_found = False
             for sel in article_selectors:
                 try:
-                    await page.wait_for_selector(sel, timeout=8000)
-                    print(f"[SYNC] ✓ 检测到文章元素: {sel}")
+                    await page.wait_for_selector(sel, timeout=5000)
+                    print(f"[SYNC] ✓ 检测到内容元素: {sel}")
+                    element_found = True
                     break
                 except:
                     continue
             
-            # 多轮滚动
-            no_new_count = 0
-            max_scroll_rounds = MAX_SYNC_SCROLLS
+            if not element_found:
+                print("[SYNC] ⚠ 未检测到明显的文章元素，可能加载慢，尝试直接滚动...")
+
+            # ============================================
+            # 3. 循环滚动 (核心逻辑)
+            # ============================================
+            print(f"[SYNC] 开始滚动加载... (计划最大滚动: {MAX_SCROLL_ROUNDS_DYNAMIC} 次)")
             
-            for scroll_round in range(max_scroll_rounds):
-                # 滚动
-                scroll_distance = random.randint(400, 700)
+            no_new_count = 0 # 连续未发现新内容的次数
+            
+            for scroll_round in range(MAX_SCROLL_ROUNDS_DYNAMIC):
+                # --- A. 执行滚动动作 ---
+                # 随机距离，模拟真人滚轮
+                scroll_distance = random.randint(500, 900) 
                 await page.mouse.wheel(0, scroll_distance)
-                await asyncio.sleep(random.uniform(1.5, 2.5))
                 
-                # 偶尔回滚（更像真人）
-                if random.random() < 0.15:
-                    await page.mouse.wheel(0, -random.randint(100, 200))
+                # 滚动后的停顿，等待 AJAX 加载 (深度抓取时稍微快一点点，但不能太快)
+                wait_time = random.uniform(1.2, 2.0) if IS_COLD_START else random.uniform(1.5, 3.0)
+                await asyncio.sleep(wait_time)
+                
+                # 10% 概率往回滚一点，非常像真人找回刚才看过的标题
+                if random.random() < 0.1:
+                    await page.mouse.wheel(0, -random.randint(100, 300))
                     await asyncio.sleep(0.5)
-                
-                # 每3次滚动提取一次链接
-                if (scroll_round + 1) % 3 == 0 or scroll_round == 0:
+
+                # --- B. 提取数据 (每滚 2 次提取一次，减少 JS 注入频率) ---
+                # 第一轮必须提取，后续隔轮提取，或者最后一轮强制提取
+                if scroll_round == 0 or (scroll_round + 1) % 2 == 0 or scroll_round == MAX_SCROLL_ROUNDS_DYNAMIC - 1:
                     current_links = await page.evaluate(EXTRACT_LINKS_JS)
                     
-                    # 统计新增
-                    new_urls = [l for l in current_links if l['href'] not in all_seen_urls]
-                    for l in current_links:
+                    # 统计本轮新增
+                    # 注意：current_links 包含页面上所有 current DOM 里的链接
+                    #我们需要看其中有多少是之前没见过的
+                    current_new_items = [l for l in current_links if l['href'] not in all_seen_urls]
+                    
+                    # 更新全局记录
+                    for l in current_new_items:
                         all_seen_urls.add(l['href'])
                     
-                    links = current_links
+                    # 更新当前持有的总链接列表
+                    links = current_links # 保存最新的全量快照
                     
-                    print(f"[SYNC] 滚动 {scroll_round + 1}/{max_scroll_rounds}: "
-                          f"当前 {len(links)} 篇 (本轮新增 {len(new_urls)})")
+                    total_grabbed = len(all_seen_urls)
+                    print(f"[SYNC] 滚动 {scroll_round + 1}/{MAX_SCROLL_ROUNDS_DYNAMIC}: "
+                          f"累计发现 {total_grabbed} 篇 (本轮新增 {len(current_new_items)})")
                     
-                    if links and len(links) > 0:
-                        articles_found = True
+                    # --- C. 判断是否应该停止 ---
                     
-                    # 检测是否到底
-                    if len(new_urls) == 0:
+                    # 1. 连续无新内容判断 (到底了)
+                    if len(current_new_items) == 0:
                         no_new_count += 1
-                        if no_new_count >= 3:
-                            print("[SYNC] 连续3次无新内容，停止滚动")
+                        if no_new_count >= 4: # 连续 4 次没刷出新东西
+                            print("[SYNC] 🛑 连续 4 次滚动无新内容，判断已到底部，停止。")
                             break
                     else:
-                        no_new_count = 0
-                    
-                    # 已获取足够文章
-                    if len(links) >= 50:
-                        print("[SYNC] 已获取50+篇文章，提前结束")
+                        no_new_count = 0 # 重置计数器
+
+                    # 2. 数量达标判断 (提前结束)
+                    if total_grabbed >= TARGET_ARTICLE_COUNT:
+                        print(f"[SYNC] 🛑 已达到目标数量 ({total_grabbed}/{TARGET_ARTICLE_COUNT})，提前结束。")
                         break
-            
-            # 最终等待
-            await human_delay(2, 3)
-            
-            # 最终提取
-            final_links = await page.evaluate(EXTRACT_LINKS_JS)
-            if final_links and len(final_links) > len(links):
-                links = final_links
-            
-            print(f"[SYNC] 最终提取: {len(links)} 篇文章")
-            
+
             # ============================================
-            # 页面刷新重试（如果没找到文章）
+            # 4. 结果处理
             # ============================================
-            if not links or len(links) == 0:
-                if attempt < MAX_RETRIES:
-                    print("[SYNC] 未发现文章，尝试刷新页面...")
-                    
-                    await page.screenshot(path=DEBUG_DIR / f"before_refresh_attempt_{attempt}.png")
-                    
-                    for refresh_attempt in range(2):
-                        print(f"[SYNC] 第 {refresh_attempt + 1} 次刷新...")
-                        await page.reload(wait_until="networkidle", timeout=30000)
-                        await human_delay(5, 7)
-                        
-                        # 快速下滑
-                        for i in range(10):
-                            await page.mouse.wheel(0, random.randint(400, 600))
-                            await asyncio.sleep(random.uniform(0.8, 1.2))
-                        
-                        await human_delay(3, 5)
-                        
-                        links = await page.evaluate(EXTRACT_LINKS_JS)
-                        if links and len(links) > 0:
-                            articles_found = True
-                            print(f"[SYNC] ✓ 刷新后发现 {len(links)} 篇文章")
-                            break
-                        else:
-                            print(f"[SYNC] 第 {refresh_attempt + 1} 次刷新仍未发现文章")
-            else:
+            if len(all_seen_urls) > 0:
                 articles_found = True
-            
-            # ============================================
-            # 结果判断
-            # ============================================
-            if articles_found and links and len(links) > 0:
-                # ========== 成功路径 ==========
-                print(f"\n[SYNC] ✅ 同步成功! 第 {attempt} 次尝试，共 {len(links)} 篇文章")
+                final_count = len(all_seen_urls)
                 
-                # 打印前5篇文章标题（验证）
+                # 整理最终结果 (去重逻辑其实在 all_seen_urls 已经做了一部分，这里确保格式)
+                # EXTRACT_LINKS_JS 返回的是 list，我们用最后一次抓取的快照，或者合并所有历史
+                # 这里的 links 变量存的是最后一次 evaluate 的结果，
+                # 但为了保险（防止页面太长 DOM 节点被移除），我们最好重新整理一遍
+                # 简单起见，直接使用 links (通常包含页面大部分内容)
+                # 如果是无限滚动且 DOM 节点回收的网页，需要用 all_seen_urls 配合历史 item 存储
+                # 鉴于头条 PC 端通常保留节点，直接用 links 即可，或者用 evaluate 再跑一次
+                
+                final_links = await page.evaluate(EXTRACT_LINKS_JS)
+                print(f"\n[SYNC] ✅ 同步成功! 第 {attempt} 次尝试，页面共存在 {len(final_links)} 篇文章")
+                
+                # 打印样本
                 print("[SYNC] 文章样本:")
-                for i, link in enumerate(links[:5], 1):
-                    print(f"       {i}. [{link.get('type', '?')}] {link['text'][:40]}...")
-                
-                # 保存到数据库
-                db.add_articles(links)
+                for i, link in enumerate(final_links[:3], 1):
+                    print(f"       {i}. {link['text'][:30]}...")
+
+                # 入库
+                db.add_articles(final_links)
                 db.mark_synced()
                 
-                # 保存成功截图
+                # 清理工作
                 try:
+                    # 成功后截图留底
                     await page.screenshot(path=DEBUG_DIR / "sync_success_latest.png")
-                    print("[SYNC] ✓ 已保存成功截图")
+                    # 清理旧的报错图
+                    for p_file in DEBUG_DIR.glob("error_sync_*.png"): p_file.unlink(missing_ok=True)
                 except: pass
-                
-                # ============================================
-                # 🔥 清理旧的错误/调试文件
-                # ============================================
-                print("[SYNC] 清理旧的调试/错误文件...")
-                cleanup_patterns = [
-                    "error_sync_*.png",
-                    "debug_sync_fail_*.png",
-                    "before_refresh_*.png",
-                    "sync_source_*.html",
-                    "captcha_sync_*.png",
-                    "sync_source_final_fail.html",
-                ]
-                
-                cleaned_count = 0
-                try:
-                    for pattern in cleanup_patterns:
-                        for file_path in DEBUG_DIR.glob(pattern):
-                            try:
-                                file_path.unlink(missing_ok=True)
-                                cleaned_count += 1
-                            except:
-                                pass
-                    print(f"[SYNC] ✓ 已清理 {cleaned_count} 个旧文件")
-                except Exception as clean_err:
-                    print(f"[WARN] 清理文件时出错: {clean_err}")
-                # ============================================
                 
                 await page.close()
-                return  # 成功结束
-                
+                return # 成功退出函数
+
             else:
-                # ========== 失败路径 ==========
-                print(f"[WARN] 第 {attempt} 次尝试未能提取到文章")
-                
-                # 保存失败截图
-                try:
-                    await page.screenshot(path=DEBUG_DIR / f"debug_sync_fail_attempt_{attempt}.png")
-                except: pass
-                
-                # 保存失败的HTML
-                try:
-                    content = await page.content()
-                    (DEBUG_DIR / f"sync_source_attempt_{attempt}.html").write_text(
-                        content, encoding="utf-8"
-                    )
-                except: pass
+                # 没抓到
+                print(f"[WARN] 第 {attempt} 次尝试滚动后未发现文章 (可能是加载失败或空白页)")
+                await page.screenshot(path=DEBUG_DIR / f"error_sync_empty_{attempt}.png")
                 
                 if attempt < MAX_RETRIES:
-                    raise Exception("No links extracted after all attempts")
+                    print("[SYNC] 尝试刷新页面重试...")
+                    await asyncio.sleep(3)
 
         except Exception as e:
-            print(f"[SYNC] ❌ 第 {attempt} 次尝试失败: {e}")
-            
-            # 保存错误截图
+            print(f"[SYNC] ❌ 第 {attempt} 次尝试发生异常: {e}")
             try:
                 if not page.is_closed():
-                    await page.screenshot(path=DEBUG_DIR / f"error_sync_attempt_{attempt}.png")
-                    print(f"[SYNC] 已保存错误截图")
+                    await page.screenshot(path=DEBUG_DIR / f"error_sync_exception_{attempt}.png")
             except: pass
             
-            if attempt == MAX_RETRIES:
-                print("[FATAL] ❌ 全量同步任务最终失败，已达到最大重试次数。")
-                
-                # 保存最终的HTML源码
-                try:
-                    if not page.is_closed():
-                        content = await page.content()
-                        (DEBUG_DIR / "sync_source_final_fail.html").write_text(
-                            content, encoding="utf-8"
-                        )
-                        print("[SYNC] 已保存最终失败的HTML源码")
-                except: pass
-            else:
-                # 失败冷却
-                wait_time = random.randint(5, 10)
-                print(f"[WAIT] 等待 {wait_time} 秒后重试...")
-                await asyncio.sleep(wait_time)
+            # 失败后冷却
+            await asyncio.sleep(random.randint(5, 10))
         
         finally:
             try:
-                if not page.is_closed():
-                    await page.close()
-                    print(f"[SYNC] 已关闭第 {attempt} 次尝试的页面")
+                if not page.is_closed(): await page.close()
             except: pass
-    
-    print("[SYNC] ❌ 全量同步任务完全失败")
 
+    print("[SYNC] ❌ 全量同步任务最终失败 (所有重试耗尽)")
 
 
 async def read_article_task(context: BrowserContext, article: dict, db: ArticleDB):
