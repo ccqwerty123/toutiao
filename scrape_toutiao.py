@@ -489,73 +489,170 @@ async def sync_task(context: BrowserContext, db: ArticleDB):
         
         try:
             # 1. 尝试访问，设置较长的超时防止卡顿
-            # timeout=60000 (60秒)
-            await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(TOUTIAO_URL, wait_until="networkidle", timeout=60000)
             await human_delay(3, 5)
             
             # 2. 验证码检查
-            # 如果遇到验证码，视为当前尝试失败，记录截图并进行下一次重试（也许下次就没了）
             if await check_captcha(page, f"sync_try_{attempt}"):
                 print(f"[SYNC] 第 {attempt} 次遭遇验证码，稍后重试...")
                 raise Exception("Captcha detected")
 
-            print("[SYNC] 正在模拟下滑加载...")
-            no_change_count = 0
-            last_height = 0
+            articles_found = False
+            links = []
             
-            # 3. 循环下滑
-            for i in range(MAX_SYNC_SCROLLS):
-                await human_scroll(page, max_scrolls=1)
-                new_height = await page.evaluate("document.body.scrollHeight")
-                if new_height == last_height:
-                    no_change_count += 1
-                    if no_change_count >= 5: 
-                        print("[SYNC] 页面高度不再变化，停止下滑。")
-                        break
+            # 3. 层级1：多次下滑尝试
+            print("[SYNC] 正在模拟下滑加载...")
+            for scroll_round in range(3):  # 3轮下滑尝试
+                print(f"[SYNC] 第 {scroll_round + 1} 轮下滑...")
+                last_height = await page.evaluate("document.body.scrollHeight")
+                no_change_count = 0
+                
+                # 每轮滑动5-8次
+                scroll_times = random.randint(5, 8)
+                for i in range(scroll_times):
+                    await human_scroll(page, max_scrolls=1)
+                    await human_delay(1, 2)
+                    
+                    # 检查页面高度变化
+                    new_height = await page.evaluate("document.body.scrollHeight")
+                    if new_height == last_height:
+                        no_change_count += 1
+                        if no_change_count >= 3:
+                            print("[SYNC] 页面高度不再变化")
+                            break
+                    else:
+                        no_change_count = 0
+                    last_height = new_height
+                
+                # 等待内容渲染
+                await human_delay(2, 4)
+                
+                # 尝试提取链接
+                print("[SYNC] 执行 JS 提取链接...")
+                links = await page.evaluate(EXTRACT_LINKS_JS)
+                
+                if links and len(links) > 0:
+                    print(f"[SYNC] 第 {scroll_round + 1} 轮下滑后发现 {len(links)} 篇文章")
+                    articles_found = True
+                    
+                    # 保存调试HTML（成功时）
+                    try:
+                        debug_html_path = DEBUG_DIR / f"sync_source_success_r{scroll_round}.html"
+                        content = await page.content()
+                        debug_html_path.write_text(content, encoding="utf-8")
+                    except: pass
+                    
+                    # 继续下滑获取更多（如果还有）
+                    if new_height > last_height:
+                        print("[SYNC] 继续下滑获取更多文章...")
+                        for extra in range(3):
+                            await human_scroll(page, max_scrolls=1)
+                            await human_delay(1, 2)
+                        await human_delay(2, 3)
+                        # 再次提取
+                        links = await page.evaluate(EXTRACT_LINKS_JS)
+                        print(f"[SYNC] 额外下滑后共发现 {len(links)} 篇文章")
+                    break
                 else:
-                    no_change_count = 0
-                last_height = new_height
-
-            # 4. 保存源码用于调试 (每次尝试都覆盖最新)
+                    print(f"[SYNC] 第 {scroll_round + 1} 轮下滑未发现文章")
+                    # 如果页面已到底但没文章，不再继续这个循环
+                    if no_change_count >= 3:
+                        break
+            
+            # 4. 层级2：页面刷新重试（如果第一轮没成功且不是最后一次尝试）
+            if not articles_found and attempt < MAX_RETRIES:
+                print("[SYNC] 未发现文章，尝试刷新页面...")
+                
+                # 保存刷新前的调试截图
+                try:
+                    await page.screenshot(path=DEBUG_DIR / f"before_refresh_attempt_{attempt}.png")
+                except: pass
+                
+                for refresh_attempt in range(2):  # 最多刷新2次
+                    print(f"[SYNC] 第 {refresh_attempt + 1} 次刷新...")
+                    await page.reload(wait_until="networkidle", timeout=30000)
+                    await human_delay(5, 7)
+                    
+                    # 快速下滑
+                    for i in range(10):
+                        await human_scroll(page, max_scrolls=1)
+                        await human_delay(0.5, 1)
+                    
+                    # 等待加载
+                    await human_delay(3, 5)
+                    
+                    # 提取链接
+                    links = await page.evaluate(EXTRACT_LINKS_JS)
+                    if links and len(links) > 0:
+                        articles_found = True
+                        print(f"[SYNC] 刷新后发现 {len(links)} 篇文章")
+                        
+                        # 保存成功的HTML
+                        try:
+                            debug_html_path = DEBUG_DIR / "sync_source_after_refresh.html"
+                            content = await page.content()
+                            debug_html_path.write_text(content, encoding="utf-8")
+                        except: pass
+                        break
+                    else:
+                        print(f"[SYNC] 第 {refresh_attempt + 1} 次刷新仍未发现文章")
+            
+            # 5. 保存最终状态的源码（无论成功失败）
             try:
-                debug_html_path = DEBUG_DIR / "sync_source_latest.html"
+                debug_html_path = DEBUG_DIR / f"sync_source_attempt_{attempt}.html"
                 content = await page.content()
                 debug_html_path.write_text(content, encoding="utf-8")
             except: pass
-
-            print("[SYNC] 执行 JS 提取链接...")
-            links = await page.evaluate(EXTRACT_LINKS_JS)
             
-            # 5. 结果判断
-            if links:
+            # 6. 结果判断
+            if articles_found and links:
                 # --- 成功路径 ---
                 db.add_articles(links)
                 db.mark_synced()
                 
                 # 随机保存成功截图
                 if random.random() < 0.3:
-                    await page.screenshot(path=DEBUG_DIR / "debug_sync_success_latest.png")
+                    try:
+                        await page.screenshot(path=DEBUG_DIR / f"debug_sync_success_{attempt}.png")
+                        print(f"[SYNC] 已保存成功截图")
+                    except: pass
                     
-                print(f"[SYNC] 同步成功 (在第 {attempt} 次尝试)。")
+                print(f"[SYNC] 同步成功 (在第 {attempt} 次尝试，共 {len(links)} 篇文章)")
                 await page.close()
                 return  # 直接结束整个函数
             else:
-                # --- 软失败（页面加载了但没抓到东西）---
-                print(f"[WARN] 第 {attempt} 次尝试未提取到链接。")
-                await page.screenshot(path=DEBUG_DIR / "debug_sync_fail_latest.png")
-                # 抛出异常以触发重试逻辑
-                raise Exception("No links extracted")
+                # --- 失败路径 ---
+                print(f"[WARN] 第 {attempt} 次尝试未能提取到文章")
+                
+                # 保存失败截图
+                try:
+                    await page.screenshot(path=DEBUG_DIR / f"debug_sync_fail_attempt_{attempt}.png")
+                except: pass
+                
+                # 如果不是最后一次，准备重新打开页面
+                if attempt < MAX_RETRIES:
+                    raise Exception("No links extracted after all attempts")
 
         except Exception as e:
             print(f"[SYNC] 第 {attempt} 次尝试失败: {e}")
+            
             # 保存错误截图
             try:
-                await page.screenshot(path=DEBUG_DIR / "error_sync_latest.png")
+                await page.screenshot(path=DEBUG_DIR / f"error_sync_attempt_{attempt}.png")
+                print(f"[SYNC] 已保存错误截图")
             except: pass
             
             # 如果是最后一次尝试，打印最终失败日志
             if attempt == MAX_RETRIES:
                 print("[FATAL] 全量同步任务最终失败，已达到最大重试次数。")
+                
+                # 保存最终的HTML源码用于调试
+                try:
+                    debug_html_path = DEBUG_DIR / "sync_source_final_fail.html"
+                    content = await page.content()
+                    debug_html_path.write_text(content, encoding="utf-8")
+                    print("[SYNC] 已保存最终失败的HTML源码")
+                except: pass
             else:
                 # 失败冷却时间：失败一次休息 5~10 秒再试
                 wait_time = random.randint(5, 10)
@@ -564,11 +661,14 @@ async def sync_task(context: BrowserContext, db: ArticleDB):
         
         finally:
             # 关键：每次尝试结束后，无论成功失败，都关闭当前 Page
-            # 这样下一次循环会创建一个全新的 Page，避免旧页面的缓存或卡顿影响
             try:
                 if not page.is_closed():
                     await page.close()
+                    print(f"[SYNC] 已关闭第 {attempt} 次尝试的页面")
             except: pass
+    
+    # 如果所有重试都失败了
+    print("[SYNC] 全量同步任务完全失败")
 
 async def read_article_task(context: BrowserContext, article: dict, db: ArticleDB):
     """
