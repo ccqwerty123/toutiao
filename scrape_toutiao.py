@@ -91,8 +91,7 @@ VIEWPORTS = [
 ]
 
 # ================= JS 注入脚本 (核心逻辑优化) =================
-
-# 增强版链接提取脚本：解决 Untitled 问题
+# 增强版链接提取脚本：兼容性修复(移除?.) + 增强标题提取 + 过滤词更新
 EXTRACT_LINKS_JS = r"""
 () => {
   const anchors = Array.from(document.querySelectorAll("a[href]"));
@@ -100,87 +99,171 @@ EXTRACT_LINKS_JS = r"""
   const results = [];
   const seen = new Set();
   
-  // 严格的文章路径特征判断
+  // 1. 路径特征判断
   const isArticle = (path) => {
-     if (!path) return false;
-     // 排除个人主页、搜索页等
-     if (path.startsWith("/c/user/")) return false;
-     if (path.startsWith("/search/")) return false;
-     
-     // 特征1: 路径以 /a/ 开头接数字 (老版)
-     // 特征2: 路径以 /w/ 开头 (新版)
-     // 特征3: 路径最后一部分全是数字且很长
-     const lastPart = path.split("/").filter(Boolean).pop();
-     if (!lastPart) return false;
-     
-     const digits = lastPart.replace(/\D/g, "").length;
-     // 文章ID通常很长，至少10位以上，这里放宽到6位避免漏抓
-     return digits > 5; 
+    if (!path) return false;
+    if (path.startsWith("/c/user/")) return false;
+    if (path.startsWith("/search/")) return false;
+    if (path.includes("toutiao_search")) return false;
+
+    const lastPart = path.split("/").filter(Boolean).pop();
+    if (!lastPart) return false;
+    const digits = lastPart.replace(/\D/g, "").length;
+    return digits > 5;
   };
 
-  // 辅助函数：从元素及其子元素中提取有效文本
+  // 2. 基础文本提取
   const getText = (el) => {
-      if (!el) return "";
-      let txt = (el.innerText || "").trim();
-      if (txt) return txt;
-      // 尝试找 aria-label
-      txt = (el.getAttribute("aria-label") || "").trim();
-      if (txt) return txt;
-      // 尝试找 title
-      txt = (el.getAttribute("title") || "").trim();
-      if (txt) return txt;
-      // 尝试找图片 alt
-      const img = el.querySelector("img");
-      if (img) {
-          txt = (img.getAttribute("alt") || "").trim();
-      }
-      return txt;
+    if (!el) return "";
+    let txt = (el.innerText || "").trim();
+    if (txt) return txt;
+    
+    txt = (el.getAttribute("aria-label") || "").trim();
+    if (txt) return txt;
+    
+    txt = (el.getAttribute("title") || "").trim();
+    if (txt) return txt;
+    
+    const img = el.querySelector("img");
+    if (img) {
+        txt = (img.getAttribute("alt") || "").trim();
+    }
+    return txt;
   };
 
+  // 3. 截取文本
+  const truncateText = (text, maxLength = 50) => {
+    if (!text || text.length <= maxLength) return text;
+    return text.substring(0, maxLength) + "...";
+  };
+
+  // 4. 获取内容类型
+  const getContentType = (url) => {
+    if (url.includes("/article/")) return "article";
+    if (url.includes("/w/")) return "weitoutiao";
+    if (url.includes("/video/")) return "video";
+    return "unknown";
+  };
+
+  // 5. 增强的标题提取
+  const extractTitle = (a, urlObj) => {
+    let text = getText(a);
+    const contentType = getContentType(urlObj.pathname);
+
+    // 如果直接获取失败或文本太短，尝试更多方法
+    if (!text || text.length < 4) {
+        let container = a.closest('.feed-card-wrapper, .article-card, .feed-card-article-wrapper, .card-wrapper, .weitoutiao-wrap, .wtt-content');
+        
+        // --- 兼容性修改：不使用 ?. 操作符 ---
+        if (!container) {
+            if (a.parentElement && a.parentElement.parentElement && a.parentElement.parentElement.parentElement) {
+                container = a.parentElement.parentElement.parentElement;
+            }
+        }
+
+        if (container) {
+            // 微头条策略
+            if (contentType === "weitoutiao") {
+                const contentEl = container.querySelector('.weitoutiao-content, .wtt-content, .feed-card-article-content, [class*="content"]');
+                if (contentEl) {
+                    const content = contentEl.innerText.trim();
+                    if (content) {
+                        text = truncateText(content, 40);
+                    }
+                }
+            } 
+            // 视频策略
+            else if (contentType === "video") {
+                const titleEl = container.querySelector('.video-title, .title, [class*="title"]');
+                if (titleEl) {
+                    const t = titleEl.innerText.trim();
+                    if (t) text = t;
+                }
+            }
+
+            // 通用标题查找
+            if (!text || text.length < 4) {
+                const selectors = [
+                    '.title', '.feed-card-article-title', '.article-title', '.feed-card-article-l a',
+                    '[class*="title"]', 'h1, h2, h3', '.text', 'p'
+                ];
+
+                for (const selector of selectors) {
+                    const el = container.querySelector(selector);
+                    if (el) {
+                        const t = el.innerText.trim();
+                        if (t && t.length > 4) {
+                            text = truncateText(t, 50);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 最后尝试：获取容器内第一个长文本
+            if (!text || text.length < 4) {
+                const allTexts = container.innerText.trim().split('\n').filter(t => t.trim().length > 4);
+                if (allTexts.length > 0) {
+                    text = truncateText(allTexts[0], 50);
+                }
+            }
+        }
+    }
+
+    // 兜底重命名
+    if (!text || text === "Untitled") {
+        if (contentType === "weitoutiao") text = "[微头条]";
+        else if (contentType === "video") text = "[视频]";
+    }
+
+    return { text: text || "Untitled", contentType };
+  };
+
+  // 主循环
   for (const a of anchors) {
     let href = a.getAttribute("href");
     if (!href) continue;
+    
     if (href.startsWith("/")) href = origin + href;
     
     try {
         const urlObj = new URL(href);
-        // 必须是头条域名
-        if (!urlObj.hostname.includes("toutiao.com")) continue;
         
-        // 路径判断
+        if (!urlObj.hostname.includes("toutiao.com")) continue;
         if (!isArticle(urlObj.pathname)) continue;
         
         const cleanUrl = urlObj.origin + urlObj.pathname;
         if (seen.has(cleanUrl)) continue;
 
-        // --- 标题提取逻辑 ---
-        let text = getText(a);
-        
-        // 如果当前a标签没找到字，尝试往上找一层的卡片容器
-        // 今日头条的卡片结构经常是 div.title-box 包含标题，a标签只是覆盖层
-        if (!text || text.length < 4) {
-             const card = a.closest('.feed-card-wrapper, .article-card, .feed-card-article-wrapper');
-             if (card) {
-                 // 尝试找常见的标题类名
-                 const titleEl = card.querySelector('.title, .feed-card-article-title, .article-title');
-                 if (titleEl) {
-                     const t = titleEl.innerText.trim();
-                     if (t) text = t;
-                 }
-             }
-        }
-        // ------------------
+        const titleInfo = extractTitle(a, urlObj);
+        let text = titleInfo.text;
 
-        // 过滤垃圾链接文本
-        if (text.match(/备案|举报|用户|登录|下载|广告|相关推荐/)) continue;
+        // 关键词过滤 (已添加'侵权举报受理公示')
+        const filterKeywords = [
+            '跟帖评论自律管理承诺书',
+            '用户协议',
+            '隐私政策',
+            '侵权投诉',
+            '网络谣言曝光台',
+            '违法和不良信息举报',
+            '侵权举报受理公示'
+        ];
         
-        # 实在找不到标题，标为 Untitled，但链接有效依然保留
-        if (!text) text = "Untitled";
+        if (filterKeywords.some(keyword => text.includes(keyword))) continue;
 
+        // 额外的短词过滤
+        if (!text.startsWith('[') && text.match(/^(备案|举报|登录|下载|广告|相关推荐|搜索)$/)) continue;
+        
         seen.add(cleanUrl);
-        results.push({ href: cleanUrl, text: text });
-    } catch(e){}
+        results.push({ 
+            text: text, 
+            href: cleanUrl,
+            type: titleInfo.contentType
+        });
+
+    } catch(e) {}
   }
+
   return results;
 }
 """
