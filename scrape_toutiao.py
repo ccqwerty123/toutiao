@@ -39,8 +39,6 @@ MAX_READ_COUNT = 10     # 每次运行脚本最多阅读多少篇
 MIN_READ_COUNT = 3      # 每次运行脚本最少阅读多少篇
 MAX_SYNC_SCROLLS = 20   # 同步列表时最大下滑次数
 AGING_THRESHOLD = 50    # 文章“老化”阈值
-MAX_RETRIES = 3  # 最大重试次数
-
 
 # ================= User-Agent 管理 =================
 
@@ -91,7 +89,8 @@ VIEWPORTS = [
 ]
 
 # ================= JS 注入脚本 (核心逻辑优化) =================
-# 增强版链接提取脚本：兼容性修复(移除?.) + 增强标题提取 + 过滤词更新
+
+# 增强版链接提取脚本：解决 Untitled 问题
 EXTRACT_LINKS_JS = r"""
 () => {
   const anchors = Array.from(document.querySelectorAll("a[href]"));
@@ -99,171 +98,87 @@ EXTRACT_LINKS_JS = r"""
   const results = [];
   const seen = new Set();
   
-  // 1. 路径特征判断
+  // 严格的文章路径特征判断
   const isArticle = (path) => {
-    if (!path) return false;
-    if (path.startsWith("/c/user/")) return false;
-    if (path.startsWith("/search/")) return false;
-    if (path.includes("toutiao_search")) return false;
-
-    const lastPart = path.split("/").filter(Boolean).pop();
-    if (!lastPart) return false;
-    const digits = lastPart.replace(/\D/g, "").length;
-    return digits > 5;
+     if (!path) return false;
+     // 排除个人主页、搜索页等
+     if (path.startsWith("/c/user/")) return false;
+     if (path.startsWith("/search/")) return false;
+     
+     // 特征1: 路径以 /a/ 开头接数字 (老版)
+     // 特征2: 路径以 /w/ 开头 (新版)
+     // 特征3: 路径最后一部分全是数字且很长
+     const lastPart = path.split("/").filter(Boolean).pop();
+     if (!lastPart) return false;
+     
+     const digits = lastPart.replace(/\D/g, "").length;
+     // 文章ID通常很长，至少10位以上，这里放宽到6位避免漏抓
+     return digits > 5; 
   };
 
-  // 2. 基础文本提取
+  // 辅助函数：从元素及其子元素中提取有效文本
   const getText = (el) => {
-    if (!el) return "";
-    let txt = (el.innerText || "").trim();
-    if (txt) return txt;
-    
-    txt = (el.getAttribute("aria-label") || "").trim();
-    if (txt) return txt;
-    
-    txt = (el.getAttribute("title") || "").trim();
-    if (txt) return txt;
-    
-    const img = el.querySelector("img");
-    if (img) {
-        txt = (img.getAttribute("alt") || "").trim();
-    }
-    return txt;
+      if (!el) return "";
+      let txt = (el.innerText || "").trim();
+      if (txt) return txt;
+      // 尝试找 aria-label
+      txt = (el.getAttribute("aria-label") || "").trim();
+      if (txt) return txt;
+      // 尝试找 title
+      txt = (el.getAttribute("title") || "").trim();
+      if (txt) return txt;
+      // 尝试找图片 alt
+      const img = el.querySelector("img");
+      if (img) {
+          txt = (img.getAttribute("alt") || "").trim();
+      }
+      return txt;
   };
 
-  // 3. 截取文本
-  const truncateText = (text, maxLength = 50) => {
-    if (!text || text.length <= maxLength) return text;
-    return text.substring(0, maxLength) + "...";
-  };
-
-  // 4. 获取内容类型
-  const getContentType = (url) => {
-    if (url.includes("/article/")) return "article";
-    if (url.includes("/w/")) return "weitoutiao";
-    if (url.includes("/video/")) return "video";
-    return "unknown";
-  };
-
-  // 5. 增强的标题提取
-  const extractTitle = (a, urlObj) => {
-    let text = getText(a);
-    const contentType = getContentType(urlObj.pathname);
-
-    // 如果直接获取失败或文本太短，尝试更多方法
-    if (!text || text.length < 4) {
-        let container = a.closest('.feed-card-wrapper, .article-card, .feed-card-article-wrapper, .card-wrapper, .weitoutiao-wrap, .wtt-content');
-        
-        // --- 兼容性修改：不使用 ?. 操作符 ---
-        if (!container) {
-            if (a.parentElement && a.parentElement.parentElement && a.parentElement.parentElement.parentElement) {
-                container = a.parentElement.parentElement.parentElement;
-            }
-        }
-
-        if (container) {
-            // 微头条策略
-            if (contentType === "weitoutiao") {
-                const contentEl = container.querySelector('.weitoutiao-content, .wtt-content, .feed-card-article-content, [class*="content"]');
-                if (contentEl) {
-                    const content = contentEl.innerText.trim();
-                    if (content) {
-                        text = truncateText(content, 40);
-                    }
-                }
-            } 
-            // 视频策略
-            else if (contentType === "video") {
-                const titleEl = container.querySelector('.video-title, .title, [class*="title"]');
-                if (titleEl) {
-                    const t = titleEl.innerText.trim();
-                    if (t) text = t;
-                }
-            }
-
-            // 通用标题查找
-            if (!text || text.length < 4) {
-                const selectors = [
-                    '.title', '.feed-card-article-title', '.article-title', '.feed-card-article-l a',
-                    '[class*="title"]', 'h1, h2, h3', '.text', 'p'
-                ];
-
-                for (const selector of selectors) {
-                    const el = container.querySelector(selector);
-                    if (el) {
-                        const t = el.innerText.trim();
-                        if (t && t.length > 4) {
-                            text = truncateText(t, 50);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // 最后尝试：获取容器内第一个长文本
-            if (!text || text.length < 4) {
-                const allTexts = container.innerText.trim().split('\n').filter(t => t.trim().length > 4);
-                if (allTexts.length > 0) {
-                    text = truncateText(allTexts[0], 50);
-                }
-            }
-        }
-    }
-
-    // 兜底重命名
-    if (!text || text === "Untitled") {
-        if (contentType === "weitoutiao") text = "[微头条]";
-        else if (contentType === "video") text = "[视频]";
-    }
-
-    return { text: text || "Untitled", contentType };
-  };
-
-  // 主循环
   for (const a of anchors) {
     let href = a.getAttribute("href");
     if (!href) continue;
-    
     if (href.startsWith("/")) href = origin + href;
     
     try {
         const urlObj = new URL(href);
-        
+        // 必须是头条域名
         if (!urlObj.hostname.includes("toutiao.com")) continue;
+        
+        // 路径判断
         if (!isArticle(urlObj.pathname)) continue;
         
         const cleanUrl = urlObj.origin + urlObj.pathname;
         if (seen.has(cleanUrl)) continue;
 
-        const titleInfo = extractTitle(a, urlObj);
-        let text = titleInfo.text;
-
-        // 关键词过滤 (已添加'侵权举报受理公示')
-        const filterKeywords = [
-            '跟帖评论自律管理承诺书',
-            '用户协议',
-            '隐私政策',
-            '侵权投诉',
-            '网络谣言曝光台',
-            '违法和不良信息举报',
-            '侵权举报受理公示'
-        ];
+        // --- 标题提取逻辑 ---
+        let text = getText(a);
         
-        if (filterKeywords.some(keyword => text.includes(keyword))) continue;
+        // 如果当前a标签没找到字，尝试往上找一层的卡片容器
+        // 今日头条的卡片结构经常是 div.title-box 包含标题，a标签只是覆盖层
+        if (!text || text.length < 4) {
+             const card = a.closest('.feed-card-wrapper, .article-card, .feed-card-article-wrapper');
+             if (card) {
+                 // 尝试找常见的标题类名
+                 const titleEl = card.querySelector('.title, .feed-card-article-title, .article-title');
+                 if (titleEl) {
+                     const t = titleEl.innerText.trim();
+                     if (t) text = t;
+                 }
+             }
+        }
+        // ------------------
 
-        // 额外的短词过滤
-        if (!text.startsWith('[') && text.match(/^(备案|举报|登录|下载|广告|相关推荐|搜索)$/)) continue;
+        // 过滤垃圾链接文本
+        if (text.match(/备案|举报|用户|登录|下载|广告|相关推荐/)) continue;
         
+        # 实在找不到标题，标为 Untitled，但链接有效依然保留
+        if (!text) text = "Untitled";
+
         seen.add(cleanUrl);
-        results.push({ 
-            text: text, 
-            href: cleanUrl,
-            type: titleInfo.contentType
-        });
-
-    } catch(e) {}
+        results.push({ href: cleanUrl, text: text });
+    } catch(e){}
   }
-
   return results;
 }
 """
@@ -477,198 +392,72 @@ async def check_captcha(page: Page, tag="unknown") -> bool:
 
 async def sync_task(context: BrowserContext, db: ArticleDB):
     """
-    全量同步任务：支持重试机制
+    全量同步任务：访问主页，抓取链接，保存调试信息。
     """
     print(">>> [SYNC] 开始执行全量同步任务...")
+    page = await context.new_page()
+    if HAS_STEALTH: await stealth_async(page)
     
-    # 循环尝试 MAX_RETRIES 次
-    for attempt in range(1, MAX_RETRIES + 1):
-        print(f">>> [SYNC] 第 {attempt}/{MAX_RETRIES} 次尝试连接...")
-        page = await context.new_page()
-        if HAS_STEALTH: await stealth_async(page)
+    try:
+        await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
+        await human_delay(3, 5)
         
-        try:
-            # 1. 尝试访问，设置较长的超时防止卡顿
-            await page.goto(TOUTIAO_URL, wait_until="networkidle", timeout=60000)
-            await human_delay(3, 5)
-            
-            # 2. 验证码检查
-            if await check_captcha(page, f"sync_try_{attempt}"):
-                print(f"[SYNC] 第 {attempt} 次遭遇验证码，稍后重试...")
-                raise Exception("Captcha detected")
+        # 初始验证码检查
+        if await check_captcha(page, "sync"):
+            return
 
-            articles_found = False
-            links = []
+        print("[SYNC] 正在模拟下滑加载...")
+        no_change_count = 0
+        last_height = 0
+        
+        # 循环下滑，加载更多历史文章
+        for i in range(MAX_SYNC_SCROLLS):
+            await human_scroll(page, max_scrolls=1)
             
-            # 3. 层级1：多次下滑尝试
-            print("[SYNC] 正在模拟下滑加载...")
-            for scroll_round in range(3):  # 3轮下滑尝试
-                print(f"[SYNC] 第 {scroll_round + 1} 轮下滑...")
-                last_height = await page.evaluate("document.body.scrollHeight")
-                no_change_count = 0
-                
-                # 每轮滑动5-8次
-                scroll_times = random.randint(5, 8)
-                for i in range(scroll_times):
-                    await human_scroll(page, max_scrolls=1)
-                    await human_delay(1, 2)
-                    
-                    # 检查页面高度变化
-                    new_height = await page.evaluate("document.body.scrollHeight")
-                    if new_height == last_height:
-                        no_change_count += 1
-                        if no_change_count >= 3:
-                            print("[SYNC] 页面高度不再变化")
-                            break
-                    else:
-                        no_change_count = 0
-                    last_height = new_height
-                
-                # 等待内容渲染
-                await human_delay(2, 4)
-                
-                # 尝试提取链接
-                print("[SYNC] 执行 JS 提取链接...")
-                links = await page.evaluate(EXTRACT_LINKS_JS)
-                
-                if links and len(links) > 0:
-                    print(f"[SYNC] 第 {scroll_round + 1} 轮下滑后发现 {len(links)} 篇文章")
-                    articles_found = True
-                    
-                    # 保存调试HTML（成功时）
-                    try:
-                        debug_html_path = DEBUG_DIR / f"sync_source_success_r{scroll_round}.html"
-                        content = await page.content()
-                        debug_html_path.write_text(content, encoding="utf-8")
-                    except: pass
-                    
-                    # 继续下滑获取更多（如果还有）
-                    if new_height > last_height:
-                        print("[SYNC] 继续下滑获取更多文章...")
-                        for extra in range(3):
-                            await human_scroll(page, max_scrolls=1)
-                            await human_delay(1, 2)
-                        await human_delay(2, 3)
-                        # 再次提取
-                        links = await page.evaluate(EXTRACT_LINKS_JS)
-                        print(f"[SYNC] 额外下滑后共发现 {len(links)} 篇文章")
+            # 检查高度变化
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == last_height:
+                no_change_count += 1
+                if no_change_count >= 5: # 连续5次没变，认为到底了
+                    print("[SYNC] 页面高度不再变化，停止下滑。")
                     break
-                else:
-                    print(f"[SYNC] 第 {scroll_round + 1} 轮下滑未发现文章")
-                    # 如果页面已到底但没文章，不再继续这个循环
-                    if no_change_count >= 3:
-                        break
-            
-            # 4. 层级2：页面刷新重试（如果第一轮没成功且不是最后一次尝试）
-            if not articles_found and attempt < MAX_RETRIES:
-                print("[SYNC] 未发现文章，尝试刷新页面...")
-                
-                # 保存刷新前的调试截图
-                try:
-                    await page.screenshot(path=DEBUG_DIR / f"before_refresh_attempt_{attempt}.png")
-                except: pass
-                
-                for refresh_attempt in range(2):  # 最多刷新2次
-                    print(f"[SYNC] 第 {refresh_attempt + 1} 次刷新...")
-                    await page.reload(wait_until="networkidle", timeout=30000)
-                    await human_delay(5, 7)
-                    
-                    # 快速下滑
-                    for i in range(10):
-                        await human_scroll(page, max_scrolls=1)
-                        await human_delay(0.5, 1)
-                    
-                    # 等待加载
-                    await human_delay(3, 5)
-                    
-                    # 提取链接
-                    links = await page.evaluate(EXTRACT_LINKS_JS)
-                    if links and len(links) > 0:
-                        articles_found = True
-                        print(f"[SYNC] 刷新后发现 {len(links)} 篇文章")
-                        
-                        # 保存成功的HTML
-                        try:
-                            debug_html_path = DEBUG_DIR / "sync_source_after_refresh.html"
-                            content = await page.content()
-                            debug_html_path.write_text(content, encoding="utf-8")
-                        except: pass
-                        break
-                    else:
-                        print(f"[SYNC] 第 {refresh_attempt + 1} 次刷新仍未发现文章")
-            
-            # 5. 保存最终状态的源码（无论成功失败）
-            try:
-                debug_html_path = DEBUG_DIR / f"sync_source_attempt_{attempt}.html"
-                content = await page.content()
-                debug_html_path.write_text(content, encoding="utf-8")
-            except: pass
-            
-            # 6. 结果判断
-            if articles_found and links:
-                # --- 成功路径 ---
-                db.add_articles(links)
-                db.mark_synced()
-                
-                # 随机保存成功截图
-                if random.random() < 0.3:
-                    try:
-                        await page.screenshot(path=DEBUG_DIR / f"debug_sync_success_{attempt}.png")
-                        print(f"[SYNC] 已保存成功截图")
-                    except: pass
-                    
-                print(f"[SYNC] 同步成功 (在第 {attempt} 次尝试，共 {len(links)} 篇文章)")
-                await page.close()
-                return  # 直接结束整个函数
             else:
-                # --- 失败路径 ---
-                print(f"[WARN] 第 {attempt} 次尝试未能提取到文章")
-                
-                # 保存失败截图
-                try:
-                    await page.screenshot(path=DEBUG_DIR / f"debug_sync_fail_attempt_{attempt}.png")
-                except: pass
-                
-                # 如果不是最后一次，准备重新打开页面
-                if attempt < MAX_RETRIES:
-                    raise Exception("No links extracted after all attempts")
+                no_change_count = 0
+            last_height = new_height
 
+        # 保存当前页面快照，用于调试为什么抓不到标题 (覆盖最新一份)
+        try:
+            debug_html_path = DEBUG_DIR / "sync_source_latest.html"
+            content = await page.content()
+            debug_html_path.write_text(content, encoding="utf-8")
         except Exception as e:
-            print(f"[SYNC] 第 {attempt} 次尝试失败: {e}")
-            
-            # 保存错误截图
-            try:
-                await page.screenshot(path=DEBUG_DIR / f"error_sync_attempt_{attempt}.png")
-                print(f"[SYNC] 已保存错误截图")
-            except: pass
-            
-            # 如果是最后一次尝试，打印最终失败日志
-            if attempt == MAX_RETRIES:
-                print("[FATAL] 全量同步任务最终失败，已达到最大重试次数。")
-                
-                # 保存最终的HTML源码用于调试
-                try:
-                    debug_html_path = DEBUG_DIR / "sync_source_final_fail.html"
-                    content = await page.content()
-                    debug_html_path.write_text(content, encoding="utf-8")
-                    print("[SYNC] 已保存最终失败的HTML源码")
-                except: pass
-            else:
-                # 失败冷却时间：失败一次休息 5~10 秒再试
-                wait_time = random.randint(5, 10)
-                print(f"[WAIT] 等待 {wait_time} 秒后重试...")
-                await asyncio.sleep(wait_time)
+            print(f"[DEBUG] 保存源码失败: {e}")
+
+        print("[SYNC] 执行 JS 提取链接...")
+        links = await page.evaluate(EXTRACT_LINKS_JS)
         
-        finally:
-            # 关键：每次尝试结束后，无论成功失败，都关闭当前 Page
-            try:
-                if not page.is_closed():
-                    await page.close()
-                    print(f"[SYNC] 已关闭第 {attempt} 次尝试的页面")
-            except: pass
-    
-    # 如果所有重试都失败了
-    print("[SYNC] 全量同步任务完全失败")
+        # 调试截图 (覆盖最新一份)
+        if not links:
+            print("[WARN] 未提取到任何链接！保存截图...")
+            await page.screenshot(path=DEBUG_DIR / "debug_sync_fail_latest.png")
+        else:
+            # 只有第一次或偶尔保存成功截图，避免文件过多
+            if random.random() < 0.3:
+                await page.screenshot(path=DEBUG_DIR / "debug_sync_success_latest.png")
+
+        if links:
+            db.add_articles(links)
+            db.mark_synced()
+            print(f"[SYNC] 同步成功。")
+        else:
+            print("[SYNC] 警告：未能提取到链接，请检查 debug 目录下的截图和源码。")
+
+    except Exception as e:
+        print(f"[SYNC] 发生异常: {e}")
+        # 异常时截图 (覆盖最新一份)
+        await page.screenshot(path=DEBUG_DIR / "error_sync_latest.png")
+    finally:
+        await page.close()
 
 async def read_article_task(context: BrowserContext, article: dict, db: ArticleDB):
     """
