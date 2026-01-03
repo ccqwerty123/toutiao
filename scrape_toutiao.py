@@ -793,161 +793,212 @@ async def sync_task(context: BrowserContext, db: ArticleDB):
 
 async def read_article_task(context: BrowserContext, article: dict, db: ArticleDB):
     """
-    单篇阅读任务 - 优化版
-    改动：
-    1. 热身已在 main() 完成，这里直接访问文章
-    2. 每篇文章成功后截图
-    3. 成功后清理上一次的错误截图
-    4. 保留所有拟人化操作
+    单篇阅读任务 - 完整增强版
+    包含：双重截图验证、深度拟人化操作、智能文件清理
     """
     url = article['url']
+    
+    # 从 URL 中提取简单的 ID 用于文件名（防止文件名过长）
+    try:
+        # 尝试提取最后一段数字或字符作为ID
+        article_id = url.split('/')[-1].split('?')[0][-12:]
+    except:
+        article_id = "unknown"
+
     title_preview = article['title'][:30]
     print(f"--- [READ] 正在打开: {title_preview}... ---")
     
     page = await context.new_page()
     
-    # ⚠️ 暂时禁用 stealth（测试证明可能有负面影响）
+    # 生成本次任务的时间戳字符串 (时分秒)
+    timestamp_str = datetime.now().strftime("%H%M%S")
+
+    # ⚠️ 暂时禁用 stealth，因为部分环境下会导致检测加重，可视情况开启
     # if HAS_STEALTH: await stealth_async(page)
 
     try:
         # ============================================
-        # 🔥 直接访问文章页，热身已在 main() 完成
+        # 1. 页面访问与首屏验证
         # ============================================
+        # domcontentloaded 比 networkidle 更快，适合有广告流的页面
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         
-        # 1. 验证码与404检查
-        await human_delay(2, 3)
-        if await check_captcha(page, "read"):
+        # 强制等待 3 秒，让图片和 JS 渲染出来，确保截图不是白的
+        await asyncio.sleep(3)
+
+        # --------------------------------------------
+        # 🔥【关键】首屏截图 (START) - 证明文章加载出来了
+        # --------------------------------------------
+        try:
+            start_ss_name = f"read_{timestamp_str}_{article_id}_START.png"
+            # full_page=False 只截当前视口，避免太长导致报错
+            await page.screenshot(path=DEBUG_DIR / start_ss_name, full_page=False)
+            print(f"[READ] 📸 首屏内容已保存: {start_ss_name}")
+        except Exception as e:
+            print(f"[WARN] 首屏截图失败: {e}")
+
+        # --------------------------------------------
+        # 异常检测
+        # --------------------------------------------
+        # A. 验证码检查 (调用外部定义的 check_captcha)
+        if await check_captcha(page, "read_start"):
             return
 
+        # B. 获取页面关键信息
         page_content = await page.evaluate("document.body.innerText")
         page_title = await page.title()
         
-        # 简易的失效判断
-        invalid_keywords = ["404", "页面不存在", "文章已删除", "参数错误"]
+        # C. 404/失效判断
+        invalid_keywords = ["404", "页面不存在", "文章已删除", "参数错误", "访问受限"]
         if any(k in page_title for k in invalid_keywords):
-            print("[READ] 文章已失效，标记 invalid。")
+            print("[READ] ❌ 文章已失效，标记 invalid。")
             db.mark_invalid(url)
             return
 
         # =========================================================
-        # 阅读时长计算（保留原逻辑）
+        # 2. 智能阅读时长计算 (拟人化核心)
         # =========================================================
         
-        # 1. 字数统计
+        # A. 统计字数
         word_count = len(page_content)
         
-        # 2. 图片数量统计
+        # B. 统计图片数量 (JS 注入)
         img_count = await page.evaluate("""
             () => {
+                // 查找头条常见的文章正文区域内的图片
                 const imgs = document.querySelectorAll('article img, .tt-input__content img, .article-content img, .pgc-img img');
                 return imgs.length;
             }
         """)
 
-        # 3. 计算基准时长
+        # C. 计算基准时长
+        # 假设：人眼每秒扫视 25 个字，每张图看 5 秒
         text_time = word_count / 25.0  
         img_time = img_count * 5.0
         base_time = text_time + img_time
         
+        # 兜底：如果没提取到内容，给一个随机基础值
         if base_time < 10:
             base_time = random.randint(20, 40)
         
-        # 4. 增加随机扰动
-        variation = random.gauss(1.0, 0.2)
-        thinking_time = random.uniform(5, 15)
+        # D. 增加随机扰动 (正态分布)
+        variation = random.gauss(1.0, 0.2) # 均值1.0，标准差0.2
+        thinking_time = random.uniform(5, 15) # 额外的思考/发呆时间
         
         # 计算总时长
         calc_seconds = (base_time * variation) + thinking_time
         
-        # 5. 严格截断 (30s ~ 180s)
+        # E. 严格截断范围 (最少读 30s，最多读 180s)
         read_seconds = max(30.0, calc_seconds)
         read_seconds = min(180.0, read_seconds)
         
-        print(f"[READ] 字数:{word_count} | 图片:{img_count} | 算法计算:{calc_seconds:.1f}s")
-        print(f"[READ] >> 最终计划停留: {read_seconds:.1f}秒")
+        print(f"[READ] 统计: {word_count}字 | {img_count}图 | 算法计算:{calc_seconds:.1f}s")
+        print(f"[READ] >> ⏱️ 最终计划停留: {read_seconds:.1f}秒")
         
         # =========================================================
-        # 拟人化交互循环（完整保留）
+        # 3. 拟人化交互循环 (重中之重)
         # =========================================================
         start_read = time.time()
         scroll_count = 0
         
+        # 在规定时间内循环操作
         while (time.time() - start_read) < read_seconds:
-            # 随机下滑
+            
+            # --- 动作 1: 随机下滑 (调用外部 human_scroll) ---
+            # 每次只滑一点点，模拟边看边滑
             await human_scroll(page, max_scrolls=1)
             scroll_count += 1
             
-            # 随机鼠标移动
+            # --- 动作 2: 贝塞尔曲线鼠标移动 (调用外部 human_mouse_move) ---
+            # 30% 的概率移动鼠标，模拟人在看某些段落时鼠标无意识晃动
             if random.random() < 0.3:
-                await human_mouse_move(
-                    page, 
-                    random.randint(200, 1000), 
-                    random.randint(300, 800)
-                )
+                # 随机生成目标点
+                rand_x = random.randint(200, 1000)
+                rand_y = random.randint(300, 800)
+                await human_mouse_move(page, rand_x, rand_y)
             
-            # 极低概率模拟选中文本
+            # --- 动作 3: 模拟文本选中 (极低概率) ---
+            # 10% 的概率点击一下段落文字，很多人阅读时有这个习惯
             if random.random() < 0.1:
                 try:
-                    await page.click("p", timeout=200)
+                    # 尝试点击一个 p 标签
+                    await page.click("p", timeout=200, force=True) 
                 except: 
                     pass
             
-            # 极低概率短暂停顿（模拟思考）
+            # --- 动作 4: 随机停顿 (模拟思考/被打断) ---
+            # 5% 的概率停顿较长时间 (2-5秒)
             if random.random() < 0.05:
-                await asyncio.sleep(random.uniform(2, 5))
+                # print("[ACT] 模拟思考暂停...")
+                await asyncio.sleep(random.uniform(2.0, 5.0))
+            
+            # --- 循环间隔 ---
+            # 每次操作完，等待一小会儿，避免操作太密集
+            await asyncio.sleep(random.uniform(0.8, 2.0))
 
-        # 必须动作：滑动到底部
+        # ============================================
+        # 4. 结束动作与验证
+        # ============================================
+        
+        # 必须动作：滑动到页面最底部 (触发"已阅读"埋点)
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await human_delay(1.5, 3.0)
         
-        # ============================================
-        # 🔥 成功：截图 + 清理旧错误文件
-        # ============================================
-        print(f"[READ] ✅ 阅读完成 (滚动{scroll_count}次)")
+        print(f"[READ] ✅ 阅读时间达标 (滚动{scroll_count}次)")
         
-        # 生成截图文件名（使用时间戳区分）
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 从URL提取文章ID作为标识
-        article_id = url.split('/')[-1][:12] if '/' in url else "unknown"
-        screenshot_name = f"read_success_{timestamp_str}_{article_id}.png"
-        
+        # --------------------------------------------
+        # 🔥【关键】完读截图 (END) - 证明读到底了
+        # --------------------------------------------
+        end_ss_name = f"read_{timestamp_str}_{article_id}_END.png"
         try:
-            await page.screenshot(path=DEBUG_DIR / screenshot_name)
-            print(f"[READ] 📸 已保存截图: {screenshot_name}")
+            await page.screenshot(path=DEBUG_DIR / end_ss_name)
+            print(f"[READ] 📸 完读底部已保存: {end_ss_name}")
         except Exception as ss_err:
             print(f"[READ] ⚠ 截图失败: {ss_err}")
         
-        # 清理旧的错误截图
-        try:
-            for file_path in DEBUG_DIR.glob("error_read_*.png"):
-                file_path.unlink(missing_ok=True)
-            # 只保留最近5张成功截图，删除更早的
-            success_screenshots = sorted(
-                DEBUG_DIR.glob("read_success_*.png"),
-                key=lambda x: x.stat().st_mtime,
-                reverse=True
-            )
-            for old_file in success_screenshots[5:]:
-                old_file.unlink(missing_ok=True)
-        except Exception as clean_err:
-            print(f"[READ] ⚠ 清理旧截图失败: {clean_err}")
-        
-        # 记录阅读
+        # 记录阅读状态到数据库
         db.record_read(url)
 
-    except Exception as e:
-        print(f"[READ] ❌ 异常: {e}")
-        # 出错时截图
+        # ============================================
+        # 5. 文件清理逻辑 (防止磁盘占满)
+        # ============================================
         try:
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            await page.screenshot(path=DEBUG_DIR / f"error_read_{timestamp_str}.png")
-            print(f"[READ] 已保存错误截图")
+            # 清理 START 截图：按时间倒序排，只保留最新的 5 张
+            start_files = sorted(DEBUG_DIR.glob("*_START.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+            for old_file in start_files[5:]:
+                old_file.unlink(missing_ok=True)
+
+            # 清理 END 截图：按时间倒序排，只保留最新的 5 张
+            end_files = sorted(DEBUG_DIR.glob("*_END.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+            for old_file in end_files[5:]:
+                old_file.unlink(missing_ok=True)
+            
+            # 清理错误截图：只保留最新的 3 张
+            error_files = sorted(DEBUG_DIR.glob("error_read_*.png"), key=lambda x: x.stat().st_mtime, reverse=True)
+            for old_file in error_files[3:]:
+                old_file.unlink(missing_ok=True)
+
+        except Exception as clean_err:
+            print(f"[READ] ⚠ 清理旧截图失败: {clean_err}")
+
+    except Exception as e:
+        print(f"[READ] ❌ 异常中断: {e}")
+        # 发生异常时的紧急截图
+        try:
+            err_name = f"error_read_{timestamp_str}.png"
+            await page.screenshot(path=DEBUG_DIR / err_name)
+            print(f"[READ] 已保存错误现场: {err_name}")
         except:
             pass
     
     finally:
-        await page.close()
+        # 确保页面关闭，释放内存
+        try:
+            if not page.is_closed():
+                await page.close()
+        except:
+            pass
+            
 
 
 # ================= 主程序入口 =================
