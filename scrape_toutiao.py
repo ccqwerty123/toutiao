@@ -9,16 +9,16 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-# 尝试导入 playwright-stealth，这是目前最强的反指纹库
+# 尝试导入 playwright-stealth
 try:
     from playwright_stealth import stealth_async
     HAS_STEALTH = True
-except ImportError:
+except Exception as e:
     HAS_STEALTH = False
     print("================================================================")
-    print("[WARN] 未检测到 playwright-stealth 库！")
-    print("       强烈建议安装: pip install playwright-stealth")
-    print("       否则无头模式(Headless)极易被今日头条风控识别。")
+    print(f"[ERROR] playwright-stealth 导入失败！")
+    print(f"[DEBUG] 错误详情: {e}")  # <--- 这行代码会告诉我们真正原因
+    print(f"[DEBUG] 错误类型: {type(e)}")
     print("================================================================")
 
 # ================= 配置区域 =================
