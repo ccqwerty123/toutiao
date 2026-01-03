@@ -55,10 +55,11 @@ jobs:
           python -m playwright install --with-deps chromium
 
       # 验证库是否安装成功 (可选，用于调试)
-      - name: Verify libraries
+      - name: Verify libraries (Strict)
         if: steps.check_run.outputs.should_run == 'true'
         run: |
-          python -c "import real_useragent; print('real_useragent OK'); import playwright_stealth; print('playwright_stealth OK')"
+           python -c "import sys; print(sys.path)"
+           python -c "from playwright_stealth import stealth_async; print('stealth_async 导入成功！')"
 
       - name: Run Toutiao scraper
         if: steps.check_run.outputs.should_run == 'true'
