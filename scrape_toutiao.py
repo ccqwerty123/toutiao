@@ -9,39 +9,40 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-# 尝试导入 playwright-stealth
+# ================= 依赖库检测 =================
 try:
+    # 尝试导入 playwright-stealth 增强防爬能力
     from playwright_stealth import stealth_async
     HAS_STEALTH = True
-except Exception as e:
+except ImportError:
     HAS_STEALTH = False
     print("================================================================")
-    print(f"[ERROR] playwright-stealth 导入失败！")
-    print(f"[DEBUG] 错误详情: {e}")  # <--- 这行代码会告诉我们真正原因
-    print(f"[DEBUG] 错误类型: {type(e)}")
+    print(f"[WARN] 未安装 playwright-stealth 库。")
+    print(f"[WARN] 建议运行: pip install playwright-stealth 以降低被检测风险。")
     print("================================================================")
 
 # ================= 配置区域 =================
 
-# 目标用户主页 Token URL
+# 目标用户主页 Token URL (请确保此链接有效)
 TOUTIAO_URL = "https://www.toutiao.com/c/user/token/CiyRLPHkUyTCD9FmHodOGQVcmZh5-NRKyfiTSF0XMms-tSja0FdhrUWRp-T-DBpJCjwAAAAAAAAAAAAAT8lExjCbDHcWTgszQQjqU0Ohh9qtuXbuEOe6CQdqJEZ7yIpoM-NJ93_Sty1iMpOe_FUQ9ZmDDhjDxYPqBCIBA9GPpzc="
 
-# 数据存储路径
+# 输出设置
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_FILE = DATA_DIR / "toutiao_db.json"
 DEBUG_DIR = DATA_DIR / "debug"
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-# 任务配置
-MAX_READ_COUNT = 10     # 每次脚本运行最多读多少篇
-MIN_READ_COUNT = 3      # 每次脚本运行最少读多少篇
-AGING_THRESHOLD = 50    # 阅读次数老化阈值 (超过此次数后，被选中概率降低，但不会为0)
-MAX_SYNC_SCROLLS = 25   # 每日同步链接时，最大下滑次数
+# 浏览行为限制
+MAX_READ_COUNT = 10     # 每次运行脚本最多阅读多少篇
+MIN_READ_COUNT = 3      # 每次运行脚本最少阅读多少篇
+MAX_SYNC_SCROLLS = 20   # 同步列表时最大下滑次数
+AGING_THRESHOLD = 50    # 文章“老化”阈值
 
-# ================= User-Agent 管理 (恢复全量) =================
+# ================= User-Agent 管理 =================
 
-# 内置兜底 PC UA 库 (覆盖 Windows, Mac, Chrome, Edge, Safari)
+# 内置兜底 PC UA 库 (覆盖主流浏览器与操作系统)
 FALLBACK_PC_UAS = [
     # Windows 10/11 Chrome
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -52,36 +53,135 @@ FALLBACK_PC_UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
     # Mac Chrome
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, Like Gecko) Chrome/119.0.0.0 Safari/537.36",
     # Mac Safari
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
-    # Linux Chrome (少量)
+    # Linux Chrome
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ]
 
 def get_pc_user_agent():
-    """优先使用 real_useragent，失败则随机抽取内置列表"""
+    """
+    优先使用 real-useragent 库获取随机 PC UA。
+    如果获取失败或库未安装，使用内置列表兜底。
+    """
     ua = ""
     try:
         from real_useragent import UserAgent
-        ua = UserAgent().desktop_useragent()
+        rua = UserAgent()
+        ua = rua.desktop_useragent()
+        # 简单校验获取的UA是否合法
+        if not ua or len(ua) < 20:
+            raise ValueError("UA too short")
     except Exception:
-        pass
-    
-    if not ua or len(ua) < 10:
         ua = random.choice(FALLBACK_PC_UAS)
+    
     return ua
 
-# ================= 常见 PC 分辨率库 =================
-# 随机选用，避免所有无头浏览器都是 800x600 或 1280x720
+# 常见 PC 分辨率库 (避免单一指纹)
 VIEWPORTS = [
     {"width": 1920, "height": 1080},
-    {"width": 1366, "height": 768},
     {"width": 1536, "height": 864},
     {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
     {"width": 1280, "height": 720},
 ]
+
+# ================= JS 注入脚本 (核心逻辑优化) =================
+
+# 增强版链接提取脚本：解决 Untitled 问题
+EXTRACT_LINKS_JS = r"""
+() => {
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const origin = window.location.origin;
+  const results = [];
+  const seen = new Set();
+  
+  // 严格的文章路径特征判断
+  const isArticle = (path) => {
+     if (!path) return false;
+     // 排除个人主页、搜索页等
+     if (path.startsWith("/c/user/")) return false;
+     if (path.startsWith("/search/")) return false;
+     
+     // 特征1: 路径以 /a/ 开头接数字 (老版)
+     // 特征2: 路径以 /w/ 开头 (新版)
+     // 特征3: 路径最后一部分全是数字且很长
+     const lastPart = path.split("/").filter(Boolean).pop();
+     if (!lastPart) return false;
+     
+     const digits = lastPart.replace(/\D/g, "").length;
+     // 文章ID通常很长，至少10位以上，这里放宽到6位避免漏抓
+     return digits > 5; 
+  };
+
+  // 辅助函数：从元素及其子元素中提取有效文本
+  const getText = (el) => {
+      if (!el) return "";
+      let txt = (el.innerText || "").trim();
+      if (txt) return txt;
+      // 尝试找 aria-label
+      txt = (el.getAttribute("aria-label") || "").trim();
+      if (txt) return txt;
+      // 尝试找 title
+      txt = (el.getAttribute("title") || "").trim();
+      if (txt) return txt;
+      // 尝试找图片 alt
+      const img = el.querySelector("img");
+      if (img) {
+          txt = (img.getAttribute("alt") || "").trim();
+      }
+      return txt;
+  };
+
+  for (const a of anchors) {
+    let href = a.getAttribute("href");
+    if (!href) continue;
+    if (href.startsWith("/")) href = origin + href;
+    
+    try {
+        const urlObj = new URL(href);
+        // 必须是头条域名
+        if (!urlObj.hostname.includes("toutiao.com")) continue;
+        
+        // 路径判断
+        if (!isArticle(urlObj.pathname)) continue;
+        
+        const cleanUrl = urlObj.origin + urlObj.pathname;
+        if (seen.has(cleanUrl)) continue;
+
+        // --- 标题提取逻辑 ---
+        let text = getText(a);
+        
+        // 如果当前a标签没找到字，尝试往上找一层的卡片容器
+        // 今日头条的卡片结构经常是 div.title-box 包含标题，a标签只是覆盖层
+        if (!text || text.length < 4) {
+             const card = a.closest('.feed-card-wrapper, .article-card, .feed-card-article-wrapper');
+             if (card) {
+                 // 尝试找常见的标题类名
+                 const titleEl = card.querySelector('.title, .feed-card-article-title, .article-title');
+                 if (titleEl) {
+                     const t = titleEl.innerText.trim();
+                     if (t) text = t;
+                 }
+             }
+        }
+        // ------------------
+
+        // 过滤垃圾链接文本
+        if (text.match(/备案|举报|用户|登录|下载|广告|相关推荐/)) continue;
+        
+        # 实在找不到标题，标为 Untitled，但链接有效依然保留
+        if (!text) text = "Untitled";
+
+        seen.add(cleanUrl);
+        results.push({ href: cleanUrl, text: text });
+    } catch(e){}
+  }
+  return results;
+}
+"""
 
 # ================= 数据库管理类 =================
 
@@ -101,7 +201,6 @@ class ArticleDB:
 
     def save(self):
         try:
-            # 使用 ensure_ascii=False 保证中文可读
             self.db_path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             print(f"[DB] 保存失败: {e}")
@@ -116,35 +215,37 @@ class ArticleDB:
         self.save()
 
     def add_articles(self, scraped_items: list):
-        """增量添加文章，不覆盖已有的阅读数据"""
+        """增量添加文章"""
         added_count = 0
         current_urls = self.data["articles"]
         
         for item in scraped_items:
             url = item['href']
-            # 只有当URL不存在时才添加
+            # 如果是新链接，或者旧链接是Untitled但这次抓到了真标题，则更新
             if url not in current_urls:
                 current_urls[url] = {
                     "title": item['text'],
                     "url": url,
-                    "status": "active",  # active: 正常, invalid: 失效/404
-                    "last_read_at": "",  # 上次阅读日期 YYYY-MM-DD
-                    "read_count": 0      # 累计阅读次数
+                    "status": "active",
+                    "last_read_at": "",
+                    "read_count": 0
                 }
                 added_count += 1
+            elif current_urls[url]["title"] == "Untitled" and item['text'] != "Untitled":
+                 current_urls[url]["title"] = item['text'] # 修正标题
         
-        print(f"[DB] 数据库更新: 新增 {added_count} 篇，总库存 {len(current_urls)} 篇")
+        print(f"[DB] 数据库更新: 新增 {added_count} 篇，当前总库存 {len(current_urls)} 篇")
         self.save()
 
     def mark_invalid(self, url):
-        """标记文章失效（以后不再读取）"""
+        """标记失效"""
         if url in self.data["articles"]:
             self.data["articles"][url]["status"] = "invalid"
-            print(f"[DB] 链接标记为无效 (404/删除): {url}")
+            print(f"[DB] 链接标记为无效: {url}")
             self.save()
 
     def record_read(self, url):
-        """记录阅读：更新日期，增加计数"""
+        """记录阅读"""
         if url in self.data["articles"]:
             today = datetime.now().strftime("%Y-%m-%d")
             entry = self.data["articles"][url]
@@ -153,12 +254,7 @@ class ArticleDB:
             self.save()
 
     def get_weighted_candidates(self) -> list:
-        """
-        核心逻辑：根据权重获取今日待读文章。
-        1. 排除 status != active
-        2. 排除 last_read_at == today (每天每篇只读一次)
-        3. 权重计算：次数越少权重越高，次数>50权重最低但保留。
-        """
+        """获取今日阅读列表：权重算法"""
         today = datetime.now().strftime("%Y-%m-%d")
         candidates = []
         weights = []
@@ -168,25 +264,27 @@ class ArticleDB:
         for url in active_urls:
             info = self.data["articles"][url]
             
-            # 规则1：今天读过的，绝对不读
+            # 规则1: 今天读过的绝对不读
             if info.get("last_read_at") == today:
                 continue
             
             read_count = info.get("read_count", 0)
             
-            # 规则2：计算权重 (Weighting Strategy)
-            # 新文章(count<5): 权重 100
-            # 普通(5<=count<20): 权重 50
-            # 熟悉(20<=count<50): 权重 10
-            # 老化(count>=50): 权重 1 (保留被选中的微小概率，防止死库)
-            if read_count < 5:
+            # 规则2: 权重计算
+            # 没读过的(0次): 极高权重 200
+            # 读得少的(<5次): 高权重 100
+            # 普通(<20次): 中权重 50
+            # 老旧(>50次): 低权重 5 (保留微小概率)
+            if read_count == 0:
+                w = 200
+            elif read_count < 5:
                 w = 100
             elif read_count < 20:
                 w = 50
             elif read_count < AGING_THRESHOLD:
-                w = 10
+                w = 20
             else:
-                w = 1  # 只要不是0，就有机会被选中
+                w = 5
             
             candidates.append(info)
             weights.append(w)
@@ -194,34 +292,31 @@ class ArticleDB:
         if not candidates:
             return []
 
-        # 随机抽取逻辑
+        # 无放回抽取
         target_k = random.randint(MIN_READ_COUNT, MAX_READ_COUNT)
         target_k = min(target_k, len(candidates))
         
-        print(f"[PLAN] 可选库: {len(candidates)} 篇. 计划抽取: {target_k} 篇")
+        print(f"[PLAN] 可选文章库: {len(candidates)} 篇. 计划阅读: {target_k} 篇")
         
-        # 使用 random.choices (有放回) 或者 custom logic (无放回权重抽取)
-        # 这里为了去重，实现无放回的加权抽取
         selected = []
         temp_cand = list(candidates)
         temp_weight = list(weights)
         
         for _ in range(target_k):
             if not temp_cand: break
-            # 抽取一个
             chosen = random.choices(temp_cand, weights=temp_weight, k=1)[0]
             selected.append(chosen)
             
-            # 从列表中移除，防止重复选中
             idx = temp_cand.index(chosen)
             temp_cand.pop(idx)
             temp_weight.pop(idx)
             
         return selected
 
-# ================= 拟人化动作 =================
+# ================= 拟人化操作函数 =================
 
 async def human_delay(min_s=1.0, max_s=3.0):
+    """带随机性的等待"""
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 async def human_mouse_move(page: Page, x_target, y_target, steps=25):
@@ -230,7 +325,6 @@ async def human_mouse_move(page: Page, x_target, y_target, steps=25):
         start_x = random.randint(100, 1000)
         start_y = random.randint(100, 600)
         
-        # 两个控制点，创造平滑曲线
         ctrl_x1 = start_x + (x_target - start_x) * 0.3 + random.randint(-50, 50)
         ctrl_y1 = start_y + (y_target - start_y) * 0.3 + random.randint(-50, 50)
         ctrl_x2 = start_x + (x_target - start_x) * 0.7 + random.randint(-50, 50)
@@ -238,90 +332,69 @@ async def human_mouse_move(page: Page, x_target, y_target, steps=25):
 
         for i in range(steps + 1):
             t = i / steps
-            # 三阶贝塞尔公式
             x = (1-t)**3 * start_x + 3*(1-t)**2 * t * ctrl_x1 + 3*(1-t)*t**2 * ctrl_x2 + t**3 * x_target
             y = (1-t)**3 * start_y + 3*(1-t)**2 * t * ctrl_y1 + 3*(1-t)*t**2 * ctrl_y2 + t**3 * y_target
             
-            # 加一点随机抖动
-            noise_x = random.uniform(-2, 2)
-            noise_y = random.uniform(-2, 2)
+            # 抖动
+            x += random.uniform(-2, 2)
+            y += random.uniform(-2, 2)
             
-            await page.mouse.move(x + noise_x, y + noise_y)
+            await page.mouse.move(x, y)
             await asyncio.sleep(random.uniform(0.005, 0.015))
     except Exception:
         pass
 
 async def human_scroll(page: Page, max_scrolls=1):
+    """拟人化滚动"""
     for _ in range(max_scrolls):
-        delta = random.randint(300, 800)
-        await page.mouse.wheel(0, delta)
-        await human_delay(1.5, 3.0)
-        # 偶尔回滚（回看）
-        if random.random() < 0.25:
-            await page.mouse.wheel(0, -random.randint(150, 300))
-            await human_delay(0.8, 1.5)
+        # 随机滚动幅度
+        delta_y = random.randint(300, 700)
+        await page.mouse.wheel(0, delta_y)
+        
+        # 滚动后的停顿，模拟阅读
+        await human_delay(1.0, 2.5)
+        
+        # 20% 概率回滚 (回看)
+        if random.random() < 0.2:
+            await page.mouse.wheel(0, -random.randint(100, 250))
+            await human_delay(0.5, 1.2)
 
-async def check_captcha(page: Page) -> bool:
+async def check_captcha(page: Page, tag="unknown") -> bool:
+    """检查验证码，并截图（覆盖最新一份）"""
     try:
         title = await page.title()
-        # 关键词匹配
+        is_captcha = False
+        
+        # 1. 标题判断
         if any(kw in title for kw in ["验证", "安全检测", "captcha", "verify"]):
-            print(f"[ALERT] 触发验证码页面: {title}")
-            return True
-        # DOM 元素匹配
-        if await page.query_selector("#captcha-verify-image") or \
-           await page.query_selector(".captcha_verify_container"):
-            return True
-        return False
-    except:
-        return False
-
-# ================= 业务逻辑: 同步与阅读 =================
-
-EXTRACT_LINKS_JS = r"""
-() => {
-  const anchors = Array.from(document.querySelectorAll("a[href]"));
-  const origin = window.location.origin;
-  const results = [];
-  const seen = new Set();
-  
-  const isArticle = (path) => {
-     // 简单的路径特征判断: 数字占比高或包含 /a/ /w/ 且长度足够
-     const digits = path.replace(/\D/g, "").length;
-     return digits > 5; 
-  };
-
-  for (const a of anchors) {
-    let href = a.getAttribute("href");
-    if (!href) continue;
-    if (href.startsWith("/")) href = origin + href;
-    try {
-        const urlObj = new URL(href);
-        if (!urlObj.hostname.includes("toutiao.com")) continue;
+            is_captcha = True
+            
+        # 2. DOM 判断
+        if not is_captcha:
+            if await page.query_selector("#captcha-verify-image") or \
+               await page.query_selector(".captcha_verify_container"):
+                is_captcha = True
         
-        // 排除非文章页
-        if (urlObj.pathname.startsWith("/c/user/")) continue;
-        if (!isArticle(urlObj.pathname)) continue;
-        
-        const cleanUrl = urlObj.origin + urlObj.pathname;
-        if (seen.has(cleanUrl)) continue;
+        if is_captcha:
+            print(f"[ALERT] {tag} 阶段检测到验证码! Title: {title}")
+            # 保存验证码截图，覆盖旧的同类型文件
+            screenshot_path = DEBUG_DIR / f"captcha_{tag}_latest.png"
+            await page.screenshot(path=screenshot_path)
+            print(f"[ALERT] 验证码截图已保存: {screenshot_path}")
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"[WARN] 验证码检测出错: {e}")
+        return False
 
-        let text = (a.innerText || "").trim();
-        // 过滤无关链接
-        if (text.match(/备案|举报|用户|登录|下载/)) continue;
-        if (!text) text = "Untitled";
-
-        seen.add(cleanUrl);
-        results.push({ href: cleanUrl, text: text });
-    } catch(e){}
-  }
-  return results;
-}
-"""
+# ================= 核心任务逻辑 =================
 
 async def sync_task(context: BrowserContext, db: ArticleDB):
-    """每日一次的全量抓取任务"""
-    print(">>> [SYNC] 开始执行每日同步任务...")
+    """
+    全量同步任务：访问主页，抓取链接，保存调试信息。
+    """
+    print(">>> [SYNC] 开始执行全量同步任务...")
     page = await context.new_page()
     if HAS_STEALTH: await stealth_async(page)
     
@@ -329,145 +402,201 @@ async def sync_task(context: BrowserContext, db: ArticleDB):
         await page.goto(TOUTIAO_URL, wait_until="domcontentloaded", timeout=60000)
         await human_delay(3, 5)
         
-        if await check_captcha(page):
-            print("[SYNC] 遭遇验证码，跳过同步。")
+        # 初始验证码检查
+        if await check_captcha(page, "sync"):
             return
 
-        print("[SYNC] 正在下滑列表...")
+        print("[SYNC] 正在模拟下滑加载...")
         no_change_count = 0
         last_height = 0
         
+        # 循环下滑，加载更多历史文章
         for i in range(MAX_SYNC_SCROLLS):
             await human_scroll(page, max_scrolls=1)
             
+            # 检查高度变化
             new_height = await page.evaluate("document.body.scrollHeight")
             if new_height == last_height:
                 no_change_count += 1
-                if no_change_count >= 5: # 连续5次没刷出新内容就停止
+                if no_change_count >= 5: # 连续5次没变，认为到底了
+                    print("[SYNC] 页面高度不再变化，停止下滑。")
                     break
             else:
                 no_change_count = 0
             last_height = new_height
 
-        print("[SYNC] 提取链接中...")
+        # 保存当前页面快照，用于调试为什么抓不到标题 (覆盖最新一份)
+        try:
+            debug_html_path = DEBUG_DIR / "sync_source_latest.html"
+            content = await page.content()
+            debug_html_path.write_text(content, encoding="utf-8")
+        except Exception as e:
+            print(f"[DEBUG] 保存源码失败: {e}")
+
+        print("[SYNC] 执行 JS 提取链接...")
         links = await page.evaluate(EXTRACT_LINKS_JS)
         
+        # 调试截图 (覆盖最新一份)
+        if not links:
+            print("[WARN] 未提取到任何链接！保存截图...")
+            await page.screenshot(path=DEBUG_DIR / "debug_sync_fail_latest.png")
+        else:
+            # 只有第一次或偶尔保存成功截图，避免文件过多
+            if random.random() < 0.3:
+                await page.screenshot(path=DEBUG_DIR / "debug_sync_success_latest.png")
+
         if links:
             db.add_articles(links)
             db.mark_synced()
-            print(f"[SYNC] 同步成功，当前日期标记为已同步。")
+            print(f"[SYNC] 同步成功。")
         else:
-            print("[SYNC] 未提取到链接，可能页面结构变化或加载失败。")
+            print("[SYNC] 警告：未能提取到链接，请检查 debug 目录下的截图和源码。")
 
     except Exception as e:
         print(f"[SYNC] 发生异常: {e}")
+        # 异常时截图 (覆盖最新一份)
+        await page.screenshot(path=DEBUG_DIR / "error_sync_latest.png")
     finally:
         await page.close()
 
 async def read_article_task(context: BrowserContext, article: dict, db: ArticleDB):
-    """阅读单篇文章任务"""
+    """
+    单篇阅读任务：包含优化的时长算法
+    """
     url = article['url']
-    print(f"--- [READ] 正在打开: {article['title'][:20]}... ---")
+    title_preview = article['title'][:20]
+    print(f"--- [READ] 正在打开: {title_preview}... ---")
     
     page = await context.new_page()
     if HAS_STEALTH: await stealth_async(page)
 
     try:
-        start_load = time.time()
-        # 使用 domcontentloaded 即可，networkidle 往往太慢
+        # domcontentloaded 比 networkidle 更快且够用
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         
-        # 1. 有效性与验证码检查
+        # 1. 验证码与404检查
         await human_delay(2, 3)
-        if await check_captcha(page):
-            print("[READ] 验证码拦截，跳过。")
+        if await check_captcha(page, "read"):
             return
 
-        # 检查404或删除
         page_content = await page.evaluate("document.body.innerText")
         page_title = await page.title()
         
-        invalid_keywords = ["404", "页面不存在", "文章已删除", "审核中", "参数错误"]
-        if any(k in page_title for k in invalid_keywords) or \
-           "文章已删除" in page_content[:500]: # 检查前500字即可
-            print("[READ] 文章失效，标记 invalid。")
+        # 简易的失效判断
+        invalid_keywords = ["404", "页面不存在", "文章已删除", "参数错误"]
+        if any(k in page_title for k in invalid_keywords):
+            print("[READ] 文章已失效，标记 invalid。")
             db.mark_invalid(url)
             return
 
-        # 2. 智能阅读时长计算
+        # =========================================================
+        # 核心修改：优化阅读时长计算算法
+        # 目标：30s ~ 180s 自然分布，避免一刀切
+        # =========================================================
+        
+        # 1. 字数统计
         word_count = len(page_content)
         
-        # 算法：基准时长 = 字数 / 8.3 (约500字/分钟)
-        # 如果是极短内容(少于100字)，可能是图片或视频，给予基础观察时间
-        if word_count < 100:
-            base_time = random.randint(8, 15)
-        else:
-            base_time = word_count / 8.3
-        
-        # 高斯扰动: 0.8 ~ 1.2 倍波动
-        read_seconds = base_time * random.gauss(1.0, 0.2)
-        
-        # 边界截断
-        read_seconds = max(8.0, read_seconds) # 至少读8秒
-        read_seconds = min(90.0, read_seconds) # 最多读90秒 (模拟没有耐心读完长文)
-        
-        print(f"[READ] 字数: {word_count}, 计划停留: {read_seconds:.1f}s (Current Count: {article.get('read_count',0)})")
+        # 2. 图片数量统计 (权重很大，因为图集文章字数少)
+        # 排除小图标，只找文章区域的大图
+        img_count = await page.evaluate("""
+            () => {
+                const imgs = document.querySelectorAll('article img, .tt-input__content img, .article-content img, .pgc-img img');
+                return imgs.length;
+            }
+        """)
 
-        # 3. 交互循环
+        # 3. 计算基准时长
+        # 假设：PC端快速浏览速度为 25字/秒 (1500字/分钟)
+        # 假设：每张大图浏览耗时 5秒
+        text_time = word_count / 25.0  
+        img_time = img_count * 5.0
+        
+        base_time = text_time + img_time
+        
+        # 兜底：如果没字也没图 (可能是视频或加载部分失败)，给一个基础值
+        if base_time < 10:
+            base_time = random.randint(20, 40)
+        
+        # 4. 增加随机扰动
+        # 高斯分布：均值1.0，标准差0.2 -> 产生 0.8 ~ 1.2 的倍数
+        variation = random.gauss(1.0, 0.2)
+        
+        # 额外增加“思考/发呆”时间 (5~15秒)
+        thinking_time = random.uniform(5, 15)
+        
+        # 计算总时长
+        calc_seconds = (base_time * variation) + thinking_time
+        
+        # 5. 严格截断 (30s ~ 180s)
+        read_seconds = max(30.0, calc_seconds)
+        read_seconds = min(180.0, read_seconds)
+        
+        print(f"[READ] 字数:{word_count} | 图片:{img_count} | 算法计算:{calc_seconds:.1f}s")
+        print(f"[READ] >> 最终计划停留: {read_seconds:.1f}秒")
+        
+        # =========================================================
+
+        # 交互循环
         start_read = time.time()
         while (time.time() - start_read) < read_seconds:
-            # 随机滚动
+            # 随机下滑
             await human_scroll(page, max_scrolls=1)
             
-            # 随机鼠标轨迹
+            # 随机鼠标移动
             if random.random() < 0.3:
-                await human_mouse_move(page, random.randint(100, 1000), random.randint(200, 800))
+                await human_mouse_move(page, random.randint(200, 1000), random.randint(300, 800))
             
-            # 随机选中 (User Engagement)
-            if random.random() < 0.15:
+            # 极低概率模拟选中文本 (模拟用户阅读时的习惯性动作)
+            if random.random() < 0.1:
                 try:
-                    await page.click("p", timeout=500)
+                    await page.click("p", timeout=200)
                 except: pass
 
-        # 4. 到底部 (模拟看完评论)
+        # 必须动作：滑动到底部 (模拟看完/看评论)
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await human_delay(1, 2)
+        await human_delay(1.5, 3.0)
         
-        print("[READ] 完成。")
+        # 成功完成
+        print(f"[READ] 阅读完成。")
         db.record_read(url)
 
     except Exception as e:
         print(f"[READ] 异常: {e}")
+        # 出错时截图 (覆盖最新一份)
+        await page.screenshot(path=DEBUG_DIR / "error_read_latest.png")
     finally:
         await page.close()
 
-# ================= 主程序 =================
+# ================= 主程序入口 =================
 
 async def main():
-    # 1. 初始化
+    # 1. 准备工作
     db = ArticleDB(DB_FILE)
     
-    # 随机选择一个分辨率
+    # 随机选择视窗
     vp = random.choice(VIEWPORTS)
+    # 获取随机 UA
     ua = get_pc_user_agent()
     
-    print(f"[INIT] 启动爬虫 | UA: {ua[:40]}... | VP: {vp['width']}x{vp['height']}")
+    print(f"[INIT] 启动爬虫任务")
+    print(f"[INIT] UA: {ua[:50]}...")
+    print(f"[INIT] Viewport: {vp['width']}x{vp['height']}")
 
     async with async_playwright() as p:
-        # 启动浏览器 (加强防检测参数)
+        # 启动浏览器
+        # 生产环境保持 headless=True
         browser = await p.chromium.launch(
-            headless=True, # 生产环境保持 True
+            headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled", # 核心去自动化特征
+                "--disable-blink-features=AutomationControlled", # 去除自动化特征
                 "--no-sandbox",
                 "--disable-infobars",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                f"--window-size={vp['width']},{vp['height']}"
+                "--window-size={},{}".format(vp['width'], vp['height'])
             ]
         )
         
-        # 创建干净的上下文 (不保存Cookie，每次都是新访客，防止被追踪行为轨迹)
+        # 创建上下文
         context = await browser.new_context(
             user_agent=ua,
             viewport=vp,
@@ -479,48 +608,51 @@ async def main():
             java_script_enabled=True
         )
 
-        # 兜底注入 webdriver 移除
+        # 注入 webdriver 移除脚本 (双重保险)
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # --- 阶段一：检查是否需要全量同步 ---
-        if db.needs_sync():
+        # --- 步骤 1: 检查是否需要全量同步 ---
+        # 如果今天是第一次运行，或者数据库为空，则执行同步
+        if db.needs_sync() or not db.data.get("articles"):
             await sync_task(context, db)
         else:
-            print("[INIT] 今日已同步过链接，跳过抓取步骤。")
+            print("[INIT] 今日已执行过同步，跳过列表抓取。")
 
-        # --- 阶段二：获取阅读列表 ---
-        # 这里会应用“权重算法”和“防重复阅读”
+        # --- 步骤 2: 获取今日阅读目标 ---
         targets = db.get_weighted_candidates()
         
         if not targets:
-            print("[DONE] 当前没有符合条件的文章 (今日已读完或无新文章)。")
+            print("[DONE] 暂无待读文章 (可能已全部读完或无新内容)。")
             await browser.close()
             return
 
-        # --- 阶段三：执行阅读 ---
-        # 访问首页热身 (建立 referer 和 基础 cookie)
+        # --- 步骤 3: 首页热身 (建立信任) ---
         try:
-            print("[WARMUP] 访问首页热身...")
+            print("[WARMUP] 正在访问首页热身...")
             page_home = await context.new_page()
             if HAS_STEALTH: await stealth_async(page_home)
-            await page_home.goto("https://www.toutiao.com/", timeout=30000)
-            await human_delay(2, 4)
+            
+            await page_home.goto("https://www.toutiao.com/", timeout=45000)
+            await human_delay(2, 5)
+            # 简单动一下鼠标
+            await human_mouse_move(page_home, 500, 500)
             await page_home.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"[WARMUP] 热身跳过: {e}")
 
+        # --- 步骤 4: 循环阅读 ---
         for i, article in enumerate(targets, 1):
             print(f"\n>>> 进度 [{i}/{len(targets)}]")
             await read_article_task(context, article, db)
             
-            # 篇间休息 (Cooldown)
+            # 篇间冷却时间 (避免操作过快)
             if i < len(targets):
-                wait_time = random.randint(6, 12)
+                wait_time = random.randint(8, 15)
                 print(f"[COOL] 休息 {wait_time} 秒...")
                 await asyncio.sleep(wait_time)
 
         await browser.close()
-        print("\n[DONE] 任务全部完成。")
+        print("\n[DONE] 所有任务完成。")
 
 if __name__ == "__main__":
     asyncio.run(main())
