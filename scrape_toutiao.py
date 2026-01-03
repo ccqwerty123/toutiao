@@ -703,6 +703,42 @@ async def read_article_task(context: BrowserContext, article: dict, db: ArticleD
     finally:
         await page.close()
 
+
+# ================= 新增：全局热身函数 =================
+
+async def global_warmup(context: BrowserContext):
+    """
+    全局热身：必须在所有任务之前执行。
+    作用：先访问首页，让浏览器获取 Cookies、Session 和指纹信任。
+    """
+    print(">>> [WARMUP] 开始执行全局热身 (访问首页)...")
+    page = await context.new_page()
+    if HAS_STEALTH: await stealth_async(page)
+
+    try:
+        # 1. 访问首页，使用 networkidle 确保所有初始请求完成
+        # 注意：这里必须慢，不能急
+        await page.goto("https://www.toutiao.com/", wait_until="networkidle", timeout=60000)
+        
+        # 2. 模拟人类行为，激活页面的鼠标追踪检测
+        print("[WARMUP] 首页加载，正在模拟人类行为...")
+        await human_mouse_move(page, random.randint(300, 800), random.randint(300, 600))
+        await human_scroll(page, max_scrolls=2)
+        
+        # 3. 强制等待 5 秒，确保 Cookies 写入 Context
+        await asyncio.sleep(5)
+        
+        print("[WARMUP] 热身成功，信任已建立！")
+        
+    except Exception as e:
+        print(f"[WARMUP] 热身过程遇到小问题 (通常可忽略): {e}")
+    finally:
+        await page.close()
+
+
+
+
+
 # ================= 主程序入口 =================
 
 async def main():
@@ -720,15 +756,14 @@ async def main():
 
     async with async_playwright() as p:
         # 启动浏览器
-        # 生产环境保持 headless=True
         browser = await p.chromium.launch(
-            headless=True,
+            headless=True,  # 调试时可改为 False 观察效果
             args=[
-                "--disable-blink-features=AutomationControlled", # 去除自动化特征
+                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-infobars",
                 "--no-first-run",
-                "--disable-setuid-sandbox",    # GitHub Actions 推荐
+                "--disable-setuid-sandbox",
                 "--window-size={},{}".format(vp['width'], vp['height'])
             ]
         )
@@ -745,11 +780,16 @@ async def main():
             java_script_enabled=True
         )
 
-        # 注入 webdriver 移除脚本 (双重保险)
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
+        # ==========================================
+        # 【核心修改点】在此处插入热身，必须放在最前面！
+        # ==========================================
+        await global_warmup(context)
+        # ==========================================
+
         # --- 步骤 1: 检查是否需要全量同步 ---
-        # 如果今天是第一次运行，或者数据库为空，则执行同步
+        # 此时 Context 已经带有首页的 Cookies，再访问个人主页就不会被拦截了
         if db.needs_sync() or not db.data.get("articles"):
             await sync_task(context, db)
         else:
@@ -763,26 +803,13 @@ async def main():
             await browser.close()
             return
 
-        # --- 步骤 3: 首页热身 (建立信任) ---
-        try:
-            print("[WARMUP] 正在访问首页热身...")
-            page_home = await context.new_page()
-            if HAS_STEALTH: await stealth_async(page_home)
-            
-            await page_home.goto("https://www.toutiao.com/", timeout=45000)
-            await human_delay(2, 5)
-            # 简单动一下鼠标
-            await human_mouse_move(page_home, 500, 500)
-            await page_home.close()
-        except Exception as e:
-            print(f"[WARMUP] 热身跳过: {e}")
+        # --- 原步骤 3 (首页热身) 已被移动到最上方，此处删除 ---
 
         # --- 步骤 4: 循环阅读 ---
         for i, article in enumerate(targets, 1):
             print(f"\n>>> 进度 [{i}/{len(targets)}]")
             await read_article_task(context, article, db)
             
-            # 篇间冷却时间 (避免操作过快)
             if i < len(targets):
                 wait_time = random.randint(8, 15)
                 print(f"[COOL] 休息 {wait_time} 秒...")
