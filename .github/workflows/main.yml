@@ -1,10 +1,9 @@
 name: Scrape Toutiao
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # 允许手动触发
   schedule:
-    # 每天 0点到15点之间，每2小时运行一次 (UTC时间，对应北京时间早上8点到晚上11点)
-    - cron: '0 0-15/2 * * *'
+    - cron: '15 0-14/2 * * *'  # 北京时间 8:15 到 22:15，每2小时运行一次 (UTC 0-14)
 
 permissions:
   contents: write
@@ -12,108 +11,52 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # 设置超时时间，防止脚本卡死占用资源（30分钟足够了）
-    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check Execution Condition (Random Skip)
-        id: check_run
-        shell: bash
-        run: |
-          should_run="true"
-          if [ "${{ github.event_name }}" == "schedule" ]; then
-            # 生成 0 或 1 的随机数
-            ROLL=$((RANDOM % 2))
-            echo "Dice rolled (0=Skip, 1=Run): $ROLL"
-            if [ "$ROLL" -eq "0" ]; then
-              echo "Decision: 随机结果为跳过 (SKIP)."
-              should_run="false"
-            else
-              echo "Decision: 随机结果为执行 (RUN)."
-              should_run="true"
-            fi
-          else
-            echo "Trigger event is '${{ github.event_name }}'. Skipping random check. FORCE RUN."
-          fi
-          echo "should_run=$should_run" >> $GITHUB_OUTPUT
-
       - name: Setup Python
-        if: steps.check_run.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        if: steps.check_run.outputs.should_run == 'true'
         run: |
           python -m pip install --upgrade pip
-          # 【关键修改】添加了 playwright-stealth
+          # 核心修改：增加了 playwright-stealth
           python -m pip install playwright real-useragent requests playwright-stealth
           python -m playwright install --with-deps chromium
 
-      # 验证库是否安装成功 (可选，用于调试)
-      - name: Verify libraries (Strict)
-        if: steps.check_run.outputs.should_run == 'true'
+      - name: Verify Environment (Optional)
         run: |
-           python -c "import sys; print(sys.path)"
-           python -c "from playwright_stealth import stealth_async; print('stealth_async 导入成功！')"
+          python -c "import playwright_stealth; print('Stealth lib installed successfully')"
 
       - name: Run Toutiao scraper
-        if: steps.check_run.outputs.should_run == 'true'
+        # 移除了 if 条件，让 Python 脚本自己决定是否需要工作
         run: |
           echo "===== 开始运行抓取脚本 ====="
-          # 请确保你的 Python 文件名真的是 scrape_toutiao.py
-          # 如果你保存的是 toutiao_pro_bot.py，请修改下面这行
           python scrape_toutiao.py
           echo "===== 抓取脚本结束 ====="
 
-      - name: Show output files (for debug)
-        if: steps.check_run.outputs.should_run == 'true'
+      - name: Show output files (Debug)
         run: |
-          echo "===== data 目录内容 ====="
-          ls -R data/ || echo "data 目录不存在"
-          
-          # 【关键修改】检查新的数据库文件名 toutiao_db.json
-          echo "===== 数据库内容预览 (前20行) ====="
-          if [ -f data/toutiao_db.json ]; then
-            head -n 20 data/toutiao_db.json
-          else
-            echo "data/toutiao_db.json 尚未生成 (可能是第一次运行或出错)"
-          fi
-
-      - name: Upload artifacts (debug data)
-        if: steps.check_run.outputs.should_run == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: toutiao-scrape-debug
-          path: |
-            data/toutiao_db.json
-            data/debug/
-          if-no-files-found: warn
+          ls -R data || echo "Data directory not found"
 
       - name: Commit and push changes
-        if: steps.check_run.outputs.should_run == 'true' && success()
+        # 仅当 Python 脚本修改了 db.json 时才提交
+        # 这就是你的“数据库”持久化机制
         run: |
-          echo "===== 检查是否有文件变更需要提交 ====="
-          # 确保 data 目录存在，防止第一次运行报错
-          mkdir -p data
-          
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # 添加所有 data 目录下的变动
+          # 添加 data 目录下的所有变动 (包括 db.json 和 logs)
           git add data
           
+          # 检查是否有变动，有则提交
           if git diff --staged --quiet; then
-            echo "没有数据变更，跳过提交。"
-            exit 0
+            echo "No changes to commit."
+          else
+            git commit -m "Update Toutiao execution data [skip ci]"
+            git push
           fi
-          
-          git commit -m "Auto-update: Toutiao reading data [skip ci]"
-          
-          # 【关键修改】拉取最新代码防止冲突，然后推送
-          git pull --rebase origin main || git pull --rebase origin master
-          git push
