@@ -1,5 +1,5 @@
 {
-  "last_sync_date": "2026-01-04",
+  "last_sync_date": "2026-01-05",
   "articles": {
     "https://www.toutiao.com/article/7582954326130999843/": {
       "title": "退休特工父亲传授女儿“保命心法”：不管在哪，永远别背对着门坐",
@@ -439,15 +439,15 @@
       "title": "说好的拯救地球呢？看到中国电车崛起，他们把“环保”桌子掀了！",
       "url": "https://www.toutiao.com/w/1852018376961228/",
       "status": "active",
-      "last_read_at": "",
-      "read_count": 0
+      "last_read_at": "2026-01-05",
+      "read_count": 1
     },
     "https://www.toutiao.com/article/7585865480225702450/": {
       "title": "说好的拯救地球呢？看到中国电车崛起，他们把“环保”桌子掀了！",
       "url": "https://www.toutiao.com/article/7585865480225702450/",
       "status": "active",
-      "last_read_at": "",
-      "read_count": 0
+      "last_read_at": "2026-01-05",
+      "read_count": 1
     },
     "https://www.toutiao.com/w/1851956525757452/": {
       "title": "手机电量用完再充？这是在给电池“送终”，寿命缩短一半！",
@@ -586,8 +586,8 @@
       "title": "什么是“好命”？大数据统计了3800万人的一生，发现一个惊人规律",
       "url": "https://www.toutiao.com/article/7584847057169465856/",
       "status": "active",
-      "last_read_at": "",
-      "read_count": 0
+      "last_read_at": "2026-01-05",
+      "read_count": 1
     },
     "https://www.toutiao.com/article/7584835719731675663/": {
       "title": "澳洲正式封杀青少年社交账号，这会让我们的孩子更安全吗？",
@@ -824,8 +824,8 @@
       "title": "退休特工父亲传授女儿“保命心法”：不管在哪，永远别背对着门坐",
       "url": "https://www.toutiao.com/w/1851309878870016/",
       "status": "active",
-      "last_read_at": "",
-      "read_count": 0
+      "last_read_at": "2026-01-05",
+      "read_count": 1
     },
     "https://www.toutiao.com/w/1851293214240907/": {
       "title": "以前觉得热闹，现在只想清静：人变老的几个扎心迹象，全说中了",
@@ -966,6 +966,13 @@
       "status": "active",
       "last_read_at": "2026-01-04",
       "read_count": 1
+    },
+    "https://www.toutiao.com/article/7591564911382217270/": {
+      "title": "有没有那么一瞬间，你觉得眼前的世界像是假的？",
+      "url": "https://www.toutiao.com/article/7591564911382217270/",
+      "status": "active",
+      "last_read_at": "",
+      "read_count": 0
     }
   }
 }
