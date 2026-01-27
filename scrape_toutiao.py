@@ -36,7 +36,7 @@ DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 # 浏览行为限制
 MAX_READ_COUNT = 30     # 每次运行脚本最多阅读多少篇
-MIN_READ_COUNT = 3      # 每次运行脚本最少阅读多少篇
+MIN_READ_COUNT = 5      # 每次运行脚本最少阅读多少篇
 MAX_SYNC_SCROLLS = 20   # 同步列表时最大下滑次数
 AGING_THRESHOLD = 50    # 文章“老化”阈值
 MAX_RETRIES = 3  # 最大重试次数
