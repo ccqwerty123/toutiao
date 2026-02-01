@@ -3,7 +3,7 @@ name: Scrape Toutiao
 on:
   workflow_dispatch:        # 允许手动触发
   schedule:
-    - cron: '15 0-14/1 * * *'  # 北京时间 8:15 到 22:15，每2小时运行一次 (UTC 0-14)
+    - cron: '15 0-14/2 * * *'  # 北京时间 8:15 到 22:15，每2小时运行一次 (UTC 0-14)
 
 permissions:
   contents: write
